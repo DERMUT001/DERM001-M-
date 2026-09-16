@@ -1,0 +1,738 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DERMUT AI Analyzer</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Segoe UI', Arial, sans-serif; background: #0b0d14; color: #e0e0e0; min-height: 100vh; padding: 20px 16px 40px; }
+.container { max-width: 740px; margin: 0 auto; }
+
+h1 { text-align: center; font-size: 1.75rem; color: #fff; margin-bottom: 4px; }
+.subtitle { text-align: center; color: #666; font-size: 0.85rem; margin-bottom: 24px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 4px; background: #13151f; border: 1px solid #1e2130; border-radius: 10px; padding: 4px; margin-bottom: 20px; }
+.tab-btn {
+  flex: 1; padding: 10px; border: none; border-radius: 7px; cursor: pointer;
+  font-size: 0.88rem; font-weight: 600; transition: all 0.2s; background: transparent; color: #666;
+}
+.tab-btn.active { background: #1e2130; color: #fff; }
+.tab-btn:hover:not(.active) { color: #aaa; }
+.tab-pane { display: none; }
+.tab-pane.active { display: block; }
+
+/* Card */
+.card { background: #13151f; border: 1px solid #1e2130; border-radius: 12px; padding: 22px; margin-bottom: 14px; }
+
+.form-group { margin-bottom: 13px; }
+label { display: block; font-size: 0.72rem; color: #555; margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.6px; }
+input[type="file"], input[type="text"], input[type="number"] {
+  width: 100%; padding: 10px 13px; background: #0b0d14; border: 1px solid #1e2130;
+  border-radius: 8px; color: #e0e0e0; font-size: 0.93rem;
+}
+input[type="text"]::placeholder, input[type="number"]::placeholder { color: #444; }
+
+.btn {
+  width: 100%; padding: 12px; border: none; border-radius: 8px;
+  font-size: 0.95rem; font-weight: 700; cursor: pointer; transition: background 0.2s;
+  letter-spacing: 0.4px;
+}
+.btn-primary { background: #2563eb; color: #fff; }
+.btn-primary:hover { background: #1d4ed8; }
+.btn-primary:disabled { background: #1e2130; color: #444; cursor: not-allowed; }
+.btn-gold { background: linear-gradient(135deg, #b8860b 0%, #ffd700 100%); color: #000; }
+.btn-gold:hover { background: linear-gradient(135deg, #daa520 0%, #ffe44d 100%); }
+.btn-gold:disabled { background: #1e2130; color: #444; cursor: not-allowed; }
+.btn-exec-buy  { background: #052e16; color: #4ade80; border: 2px solid #166534; padding: 10px 0; font-size: 0.95rem; font-weight: 700; border-radius: 7px; cursor: pointer; flex: 1; }
+.btn-exec-sell { background: #2d0a0a; color: #f87171; border: 2px solid #7f1d1d; padding: 10px 0; font-size: 0.95rem; font-weight: 700; border-radius: 7px; cursor: pointer; flex: 1; }
+.btn-exec-buy:hover  { background: #064e1d; }
+.btn-exec-sell:hover { background: #4a0f0f; }
+.btn-exec-buy:disabled, .btn-exec-sell:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Signal header */
+.signal-header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+.signal-badge {
+  font-size: 1.2rem; font-weight: 700; padding: 5px 16px;
+  border-radius: 6px; letter-spacing: 1px;
+}
+.badge-buy   { background: #052e16; color: #4ade80; border: 1px solid #166534; }
+.badge-sell  { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+.badge-wait  { background: #1c1a05; color: #fbbf24; border: 1px solid #78350f; }
+.badge-error { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; }
+
+.pill {
+  font-size: 0.72rem; font-weight: 600; padding: 3px 9px; border-radius: 20px;
+  background: #1e2130; color: #94a3b8; border: 1px solid #2a2d3a; letter-spacing: 0.4px;
+}
+.pill-gold { background: #1a1200; color: #ffd700; border-color: #78350f; }
+.pill-prob { background: #0f172a; color: #60a5fa; border-color: #1e3a5f; }
+
+/* Conviction badge */
+.conviction-badge {
+  font-size: 0.72rem; font-weight: 700; padding: 3px 10px;
+  border-radius: 20px; border: 1px solid; letter-spacing: 0.5px;
+}
+.conv-HIGH   { color: #4ade80; border-color: #166534; background: #052e16; }
+.conv-MEDIUM { color: #fbbf24; border-color: #78350f; background: #1c1a05; }
+.conv-LOW    { color: #f87171; border-color: #7f1d1d; background: #2d0a0a; }
+
+/* Verdict banner */
+.verdict-banner {
+  display: flex; align-items: flex-start; gap: 12px;
+  border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;
+  border-left: 4px solid;
+}
+.verdict-reversal  { background: #0d1a2d; border-color: #f87171; }
+.verdict-breakout  { background: #052e16; border-color: #4ade80; }
+.verdict-continuation { background: #0d1a2d; border-color: #60a5fa; }
+.verdict-icon { font-size: 1.4rem; flex-shrink: 0; }
+.verdict-text .vtitle { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.6px; color: #555; margin-bottom: 3px; }
+.verdict-text .vbody  { font-size: 0.88rem; color: #cbd5e1; line-height: 1.5; }
+.verdict-text .vlabel { font-weight: 700; }
+.verdict-reversal  .vlabel { color: #f87171; }
+.verdict-breakout  .vlabel { color: #4ade80; }
+.verdict-continuation .vlabel { color: #60a5fa; }
+
+/* Dynamics row (sweeps + exhaustion + phase) */
+.dynamics-section { margin-bottom: 14px; }
+.dynamics-section h3 { font-size: 0.69rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 7px; }
+.dynamics-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.dyn-box { background: #0b0d14; border: 1px solid #1e2130; border-radius: 7px; padding: 9px 11px; }
+.dyn-box .dlbl { font-size: 0.67rem; color: #555; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 4px; }
+.dyn-box .dval { font-size: 0.79rem; color: #94a3b8; line-height: 1.45; }
+.dyn-sweep    .dlbl { color: #fbbf24; }
+.dyn-exhaust  .dlbl { color: #f87171; }
+.dyn-phase    .dlbl { color: #60a5fa; }
+.dyn-full { grid-column: 1 / -1; }
+
+/* Structure bar */
+.structure-bar {
+  font-size: 0.83rem; color: #94a3b8; background: #0b0d14;
+  border-radius: 6px; padding: 9px 13px; margin-bottom: 14px;
+  border-left: 3px solid #2563eb; line-height: 1.5;
+}
+.structure-bar .struct-label { font-weight: 700; }
+.bull { color: #4ade80; }
+.bear { color: #f87171; }
+.rang { color: #fbbf24; }
+
+/* Grid */
+.levels-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 16px; }
+.level-box { background: #0b0d14; border: 1px solid #1e2130; border-radius: 8px; padding: 11px 13px; }
+.level-box .lbl { font-size: 0.68rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+.level-box .val { font-size: 1.05rem; font-weight: 700; color: #fff; }
+.val-buy  { color: #4ade80; }
+.val-sell { color: #f87171; }
+.val-sl   { color: #f97316; }
+.val-tp1  { color: #34d399; }
+.val-tp2  { color: #6ee7b7; }
+.val-rr   { color: #a78bfa; }
+.val-gold { color: #ffd700; }
+
+/* Reasons */
+.reasons { margin-bottom: 16px; }
+.reason-row { margin-bottom: 10px; }
+.reason-row .rtitle { font-size: 0.69rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+.reason-row .rtext  { font-size: 0.86rem; color: #cbd5e1; line-height: 1.55; }
+
+/* Setups */
+.setups-section h3 { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+.setup-row {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 10px;
+  padding: 9px 12px; background: #0b0d14; border: 1px solid #1e2130;
+  border-radius: 7px; margin-bottom: 6px;
+}
+.setup-row.selected-setup { border-color: #2563eb; }
+.setup-left .sname { font-size: 0.85rem; font-weight: 600; color: #e0e0e0; margin-bottom: 3px; }
+.setup-left .sfactors { font-size: 0.75rem; color: #666; line-height: 1.45; }
+.setup-right { text-align: right; flex-shrink: 0; }
+.setup-right .sprob { font-size: 1rem; font-weight: 700; }
+.setup-right .sbias { font-size: 0.72rem; margin-top: 2px; }
+
+/* Key levels */
+.key-levels-section { margin-top: 8px; }
+.key-levels-section h3 { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 7px; }
+.kl-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.kl-pill { font-size: 0.75rem; padding: 3px 9px; border-radius: 20px; border: 1px solid #1e2130; background: #0b0d14; color: #94a3b8; }
+.kl-pill.support      { border-color: #166534; color: #4ade80; }
+.kl-pill.demand_zone  { border-color: #166534; color: #4ade80; }
+.kl-pill.resistance   { border-color: #7f1d1d; color: #f87171; }
+.kl-pill.supply_zone  { border-color: #7f1d1d; color: #f87171; }
+.kl-pill.order_block  { border-color: #1e3a5f; color: #60a5fa; }
+.kl-pill.fvg          { border-color: #4a1d96; color: #a78bfa; }
+.kl-pill.liquidity    { border-color: #78350f; color: #fbbf24; }
+
+/* MTF badges */
+.mtf-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
+.mtf-badge { font-size: 0.78rem; padding: 4px 12px; border-radius: 5px; font-weight: 600; border: 1px solid #1e2130; background: #0b0d14; }
+
+/* Live price */
+.live-price-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  background: #0b0d14; border: 1px solid #1e2130; border-radius: 8px;
+  padding: 10px 14px; margin-bottom: 14px;
+}
+.live-price-bar .lp-label { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+.live-price-bar .lp-price { font-size: 1.3rem; font-weight: 700; color: #ffd700; }
+.live-price-bar .lp-time  { font-size: 0.72rem; color: #555; }
+
+/* Confidence checklist */
+.checklist-section { margin-bottom: 16px; }
+.cl-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.cl-header h3 { font-size: 0.72rem; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
+.score-badge { font-size: 0.88rem; font-weight: 700; padding: 2px 10px; border-radius: 20px; border: 1px solid; background: transparent; }
+.cl-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 7px 10px; background: #0b0d14; border: 1px solid #1e2130;
+  border-radius: 6px; margin-bottom: 5px;
+}
+.cl-pts    { font-size: 0.8rem; font-weight: 700; min-width: 28px; text-align: right; flex-shrink: 0; padding-top: 1px; }
+.cl-factor { font-size: 0.82rem; font-weight: 600; color: #e0e0e0; }
+.cl-reason { font-size: 0.79rem; color: #666; }
+
+/* MT5 Execute panel */
+.mt5-panel { margin-top: 14px; }
+.mt5-toggle {
+  width: 100%; background: #0b0d14; border: 1px solid #1e2130; border-radius: 8px;
+  color: #94a3b8; font-size: 0.85rem; font-weight: 600; padding: 10px 14px;
+  cursor: pointer; text-align: left; display: flex; align-items: center; gap: 8px;
+  transition: border-color 0.2s;
+}
+.mt5-toggle:hover { border-color: #2563eb; color: #e0e0e0; }
+.mt5-toggle .mt5-arrow { margin-left: auto; transition: transform 0.2s; }
+.mt5-toggle.open .mt5-arrow { transform: rotate(180deg); }
+.mt5-form-wrap { display: none; background: #0b0d14; border: 1px solid #1e2130; border-top: none; border-radius: 0 0 8px 8px; padding: 14px; }
+.mt5-form-wrap.open { display: block; }
+.mt5-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 10px; }
+.mt5-full { grid-column: 1 / -1; }
+.mt5-btns { display: flex; gap: 8px; margin-top: 4px; }
+.mt5-status { margin-top: 10px; font-size: 0.82rem; border-radius: 6px; padding: 9px 12px; display: none; line-height: 1.5; }
+.mt5-status.ok  { background: #052e16; color: #4ade80; border: 1px solid #166534; display: block; }
+.mt5-status.err { background: #2d0a0a; color: #f87171; border: 1px solid #7f1d1d; display: block; }
+.mt5-info {
+  font-size: 0.78rem; color: #555; line-height: 1.5; margin-bottom: 10px;
+  padding: 8px 10px; background: #13151f; border-radius: 5px; border: 1px solid #1e2130;
+}
+.mt5-info a { color: #60a5fa; }
+
+/* Loading */
+.loading { text-align: center; padding: 30px; color: #888; }
+.spinner { width: 30px; height: 30px; border: 3px solid #1e2130; border-top-color: #2563eb;
+  border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 12px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.divider { border: none; border-top: 1px solid #1e2130; margin: 14px 0; }
+
+@media (max-width: 480px) {
+  .levels-grid { grid-template-columns: 1fr; }
+  .dynamics-grid { grid-template-columns: 1fr; }
+  .mt5-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🎯 DERMUT AI Analyzer</h1>
+  <p class="subtitle">Institutional-grade market structure & price action signals</p>
+
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('chart')">📊 Chart Analysis</button>
+    <button class="tab-btn" onclick="switchTab('sotd')">🥇 Signal of the Day</button>
+  </div>
+
+  <!-- ── Tab 1: Chart Analysis ── -->
+  <div id="tab-chart" class="tab-pane active">
+    <div class="card">
+      <div class="form-group">
+        <label>MT5 Chart Screenshot</label>
+        <input type="file" id="fileInput" accept="image/*">
+      </div>
+      <div class="form-group">
+        <label>Symbol</label>
+        <input type="text" id="symbol" placeholder="e.g. XAUUSD, EURUSD, GBPJPY">
+      </div>
+      <button class="btn btn-primary" id="analyzeBtn" onclick="analyzeChart()">Analyze Chart</button>
+    </div>
+    <div id="chart-result"></div>
+  </div>
+
+  <!-- ── Tab 2: Signal of the Day ── -->
+  <div id="tab-sotd" class="tab-pane">
+    <div class="card">
+      <p style="font-size:0.88rem;color:#94a3b8;margin-bottom:14px;line-height:1.6">
+        Live multi-timeframe analysis of <strong style="color:#ffd700">XAUUSD (Gold)</strong> using real-time candles, EMA stacks, RSI, ATR, liquidity sweeps and exhaustion detection across Daily · 4H · 1H.
+      </p>
+      <button class="btn btn-gold" id="sotdBtn" onclick="fetchSignalOfDay()">⚡ Get Today's Signal</button>
+    </div>
+    <div id="sotd-result"></div>
+  </div>
+</div>
+
+<script>
+// ── Globals ───────────────────────────────────────────────────────────────────
+let _currentSignal = {};
+
+// ── Tab logic ─────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  document.querySelectorAll('.tab-btn')[name === 'chart' ? 0 : 1].classList.add('active');
+}
+
+// ── Formatting ────────────────────────────────────────────────────────────────
+function fmt(n, dp) {
+  if (n == null) return '—';
+  dp = dp != null ? dp : (parseFloat(n) > 100 ? 2 : 5);
+  return parseFloat(n).toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp });
+}
+function rrFmt(v) { return v ? `1 : ${parseFloat(v).toFixed(1)}` : '—'; }
+function scoreColor(s) {
+  if (s >= 90) return '#4ade80';
+  if (s >= 75) return '#fbbf24';
+  return '#f87171';
+}
+function esc(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+function showLoading(el, msg) {
+  el.style.display = 'block';
+  el.innerHTML = `<div class="card loading"><div class="spinner"></div><p>${msg}</p></div>`;
+}
+
+// ── Error card ────────────────────────────────────────────────────────────────
+function renderError(msg) {
+  return `<div class="card">
+    <div class="signal-header"><span class="signal-badge badge-error">⚠ ERROR</span></div>
+    <p style="color:#f87171;font-size:0.88rem;line-height:1.5">${esc(msg)}</p>
+  </div>`;
+}
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+function structClass(s) {
+  if (!s) return '';
+  s = s.toLowerCase();
+  if (s.includes('bull')) return 'bull';
+  if (s.includes('bear')) return 'bear';
+  return 'rang';
+}
+
+// ── Key levels pills ──────────────────────────────────────────────────────────
+function renderKeyLevels(kls) {
+  if (!kls || !kls.length) return '';
+  const pills = kls.map(kl => {
+    const t = (kl.type || '').toLowerCase().replace(/ /g,'_');
+    return `<span class="kl-pill ${t}">${esc(kl.type)}: ${fmt(kl.price)}</span>`;
+  }).join('');
+  return `<div class="key-levels-section"><h3>Key Levels</h3><div class="kl-list">${pills}</div></div>`;
+}
+
+// ── Confidence checklist ──────────────────────────────────────────────────────
+function renderChecklist(checklist, score) {
+  if (!checklist || !checklist.length) return '';
+  const col = scoreColor(score || 0);
+  const rows = checklist.map(c => `
+    <div class="cl-row">
+      <span class="cl-pts" style="color:${c.points_awarded > 0 ? '#4ade80' : '#444'}">${c.points_awarded > 0 ? '+' + c.points_awarded : '—'}</span>
+      <div><span class="cl-factor">${esc(c.factor)}</span>${c.reason ? `<span class="cl-reason"> — ${esc(c.reason)}</span>` : ''}</div>
+    </div>`).join('');
+  return `<div class="checklist-section">
+    <div class="cl-header">
+      <h3>Confluence Checklist</h3>
+      <span class="score-badge" style="color:${col};border-color:${col}">${score != null ? score + ' / 100' : '—'}</span>
+    </div>
+    ${rows}
+  </div>`;
+}
+
+// ── All setups table ──────────────────────────────────────────────────────────
+function renderAllSetups(setups, selectedIdx) {
+  if (!setups || !setups.length) return '';
+  const rows = setups.map((s, i) => {
+    const isSel  = i === selectedIdx;
+    const biasCol= s.bias === 'buy' ? 'val-buy' : 'val-sell';
+    const sc     = s.score != null ? s.score : (s.probability != null ? s.probability : null);
+    const col    = sc != null ? scoreColor(sc) : '#666';
+    const factors= (s.factors || []).join(' · ');
+    return `<div class="setup-row${isSel ? ' selected-setup' : ''}">
+      <div class="setup-left">
+        <div class="sname">${isSel ? '⭐ ' : ''}${esc(s.name || 'Setup ' + (i+1))}</div>
+        ${factors ? `<div class="sfactors">${esc(factors)}</div>` : ''}
+      </div>
+      <div class="setup-right">
+        <div class="sprob" style="color:${col}">${sc != null ? sc + '%' : '—'}</div>
+        <div class="sbias ${biasCol}">${(s.bias||'').toUpperCase()} ${s.entry_type||''}</div>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="setups-section"><h3>All Setups Evaluated</h3>${rows}</div>`;
+}
+
+// ── Verdict banner ────────────────────────────────────────────────────────────
+function renderVerdict(d) {
+  if (!d.verdict) return '';
+  const v = d.verdict.toLowerCase();
+  const cls = v === 'reversal' ? 'verdict-reversal'
+            : v === 'breakout' ? 'verdict-breakout'
+            : 'verdict-continuation';
+  const icon = v === 'reversal' ? '↩️' : v === 'breakout' ? '🚀' : '➡️';
+  const label = v.toUpperCase();
+  return `<div class="verdict-banner ${cls}">
+    <div class="verdict-icon">${icon}</div>
+    <div class="verdict-text">
+      <div class="vtitle">AI Verdict</div>
+      <div class="vbody"><span class="vlabel">${label}</span>${d.verdict_reason ? ' — ' + esc(d.verdict_reason) : ''}</div>
+    </div>
+  </div>`;
+}
+
+// ── Dynamics section (sweeps + exhaustion + phase) ────────────────────────────
+function renderDynamics(d) {
+  const sweeps  = d.sweeps_detected   || [];
+  const exhaust = d.exhaustion_signals|| [];
+  const phase   = d.phase || '';
+  if (!sweeps.length && !exhaust.length && !phase) return '';
+
+  const sweepHtml = sweeps.length
+    ? sweeps.map(s => `<div>• ${esc(s)}</div>`).join('')
+    : '<div style="color:#444">None detected</div>';
+  const exhaHtml = exhaust.length
+    ? exhaust.map(s => `<div>• ${esc(s)}</div>`).join('')
+    : '<div style="color:#444">None detected</div>';
+  const phaseHtml = phase
+    ? esc(phase.charAt(0).toUpperCase() + phase.slice(1))
+    : '—';
+
+  return `<div class="dynamics-section">
+    <h3>Live Market Dynamics</h3>
+    <div class="dynamics-grid">
+      <div class="dyn-box dyn-sweep">
+        <div class="dlbl">⚡ Liquidity Sweeps</div>
+        <div class="dval">${sweepHtml}</div>
+      </div>
+      <div class="dyn-box dyn-exhaust">
+        <div class="dlbl">🔥 Exhaustion Signals</div>
+        <div class="dval">${exhaHtml}</div>
+      </div>
+      ${phase ? `<div class="dyn-box dyn-phase dyn-full">
+        <div class="dlbl">📊 Market Phase</div>
+        <div class="dval">${phaseHtml}</div>
+      </div>` : ''}
+    </div>
+  </div>`;
+}
+
+// ── MT5 Execute panel ─────────────────────────────────────────────────────────
+function renderMT5Panel(d, defaultSymbol) {
+  const sig    = (d.signal || '').toUpperCase();
+  if (sig !== 'BUY' && sig !== 'SELL') return '';
+  const panelId = 'mt5-' + Math.random().toString(36).slice(2);
+  const action  = sig.toLowerCase();
+  const saved   = {
+    bridge: localStorage.getItem('mt5_bridge_url') || '',
+    sym:    localStorage.getItem('mt5_last_symbol') || defaultSymbol || '',
+    lot:    localStorage.getItem('mt5_lot_size')    || '0.01',
+    count:  localStorage.getItem('mt5_num_trades')  || '1',
+  };
+
+  return `<div class="mt5-panel">
+    <button class="mt5-toggle" onclick="toggleMT5('${panelId}', this)">
+      <span>⚡</span>
+      <span>Execute on MT5</span>
+      <span class="mt5-arrow">▾</span>
+    </button>
+    <div class="mt5-form-wrap" id="${panelId}">
+      <div class="mt5-info">
+        Run <strong>mt5_bridge.py</strong> on your Windows PC, then expose it with
+        <code>ngrok http 5001</code> and paste the ngrok URL below.
+        Fields are remembered between sessions.
+      </div>
+      <div class="mt5-grid">
+        <div class="form-group mt5-full">
+          <label>Bridge URL</label>
+          <input type="text" id="${panelId}-bridge" placeholder="https://xxxx.ngrok.io"
+            value="${esc(saved.bridge)}" oninput="saveMT5Field('mt5_bridge_url', this.value)">
+        </div>
+        <div class="form-group">
+          <label>Broker Symbol</label>
+          <input type="text" id="${panelId}-sym" placeholder="e.g. XAUUSDm"
+            value="${esc(saved.sym)}" oninput="saveMT5Field('mt5_last_symbol', this.value)">
+        </div>
+        <div class="form-group">
+          <label>Lot Size</label>
+          <input type="number" id="${panelId}-lot" placeholder="0.01" step="0.01" min="0.01"
+            value="${esc(saved.lot)}" oninput="saveMT5Field('mt5_lot_size', this.value)">
+        </div>
+        <div class="form-group">
+          <label>Number of Trades</label>
+          <input type="number" id="${panelId}-count" placeholder="1" min="1" max="10"
+            value="${esc(saved.count)}" oninput="saveMT5Field('mt5_num_trades', this.value)">
+        </div>
+      </div>
+      <div class="mt5-btns">
+        <button class="btn-exec-${action}" onclick="executeOnMT5('${panelId}', ${JSON.stringify(d).replace(/</g,'\\u003c')})">
+          ${sig === 'BUY' ? '📈' : '📉'} Execute ${sig}
+        </button>
+      </div>
+      <div class="mt5-status" id="${panelId}-status"></div>
+    </div>
+  </div>`;
+}
+
+function toggleMT5(panelId, btn) {
+  const wrap = document.getElementById(panelId);
+  const open = wrap.classList.toggle('open');
+  btn.classList.toggle('open', open);
+}
+
+function saveMT5Field(key, val) {
+  localStorage.setItem(key, val);
+}
+
+async function executeOnMT5(panelId, signalData) {
+  const bridge    = document.getElementById(panelId + '-bridge').value.trim();
+  const sym       = document.getElementById(panelId + '-sym').value.trim();
+  const lot       = document.getElementById(panelId + '-lot').value.trim();
+  const count     = document.getElementById(panelId + '-count').value.trim();
+  const statusEl  = document.getElementById(panelId + '-status');
+
+  statusEl.className = 'mt5-status';
+  statusEl.textContent = '⏳ Sending to MT5 bridge…';
+  statusEl.style.display = 'block';
+
+  if (!bridge) {
+    statusEl.className = 'mt5-status err';
+    statusEl.textContent = '❌ Bridge URL is empty. Run mt5_bridge.py and paste the ngrok URL.';
+    return;
+  }
+  if (!sym) {
+    statusEl.className = 'mt5-status err';
+    statusEl.textContent = '❌ Enter the broker symbol (e.g. XAUUSDm).';
+    return;
+  }
+
+  try {
+    const res = await fetch('/execute-trade', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        bridge_url:    bridge,
+        broker_symbol: sym,
+        lot_size:      parseFloat(lot) || 0.01,
+        num_trades:    parseInt(count) || 1,
+        action:        (signalData.signal || '').toLowerCase(),
+        entry:         signalData.entry,
+        sl:            signalData.stop_loss,
+        tp1:           signalData.tp1,
+        entry_type:    signalData.entry_type || 'MARKET',
+      }),
+    });
+    const data = await res.json();
+    if (data.error) {
+      statusEl.className = 'mt5-status err';
+      statusEl.textContent = '❌ ' + data.error;
+    } else {
+      const results = data.results || [];
+      const lines = results.map(r =>
+        r.error ? `Trade ${r.trade}: ❌ ${r.error}` : `Trade ${r.trade}: ✅ Order #${r.order} filled`
+      );
+      statusEl.className = 'mt5-status ok';
+      statusEl.innerHTML = lines.join('<br>') || '✅ Executed successfully';
+    }
+  } catch(err) {
+    statusEl.className = 'mt5-status err';
+    statusEl.textContent = '❌ Network error: ' + err.message;
+  }
+}
+
+// ── Main result card ──────────────────────────────────────────────────────────
+function renderResult(d, isSOTD, defaultSymbol) {
+  if (d.signal === 'ERROR' || d.error) return renderError(d.error || 'Unknown error');
+
+  _currentSignal = d;
+
+  const sig        = d.signal || 'WAIT';
+  const badgeClass = sig === 'BUY' ? 'badge-buy' : sig === 'SELL' ? 'badge-sell' : 'badge-wait';
+  const sigIcon    = sig === 'BUY' ? '📈' : sig === 'SELL' ? '📉' : '⏳';
+
+  const entryLabel = {
+    MARKET:     'Market Order — Enter Now',
+    BUY_LIMIT:  'Buy Limit — Pullback',
+    SELL_LIMIT: 'Sell Limit — Pullback',
+    BUY_STOP:   'Buy Stop — Breakout',
+    SELL_STOP:  'Sell Stop — Breakout',
+  }[d.entry_type] || d.entry_type || '';
+
+  const sc          = structClass(d.structure || d.daily_structure || '');
+  const evClass     = sig === 'BUY' ? 'val-buy' : 'val-sell';
+  const scoreVal    = d.score != null ? d.score : null;
+  const conviction  = d.conviction || '';
+  const convClass   = conviction ? `conv-${conviction}` : '';
+
+  const scoreDisplay = scoreVal != null
+    ? `<span class="pill pill-prob" style="color:${scoreColor(scoreVal)};border-color:${scoreColor(scoreVal)}">${scoreVal}% score</span>`
+    : '';
+  const convDisplay = conviction
+    ? `<span class="conviction-badge ${convClass}">${conviction} CONVICTION</span>`
+    : '';
+
+  // MTF badges (SOTD)
+  let mtfRow = '';
+  if (isSOTD) {
+    const ds = d.daily_structure || '', fh = d.four_h_trend || '';
+    const dsc = structClass(ds), fhc = structClass(fh);
+    mtfRow = `<div class="mtf-row">
+      <span class="mtf-badge"><span class="${dsc}">●</span> Daily: ${ds.toUpperCase() || '—'}</span>
+      <span class="mtf-badge"><span class="${fhc}">●</span> 4H: ${fh.toUpperCase() || '—'}</span>
+      ${d.session ? `<span class="mtf-badge" style="color:#a78bfa">🕐 ${esc(d.session)}</span>` : ''}
+    </div>`;
+  }
+
+  // Live price (SOTD)
+  let priceBar = '';
+  if (d.current_price) {
+    const label = isSOTD ? 'XAUUSD Live Price' : (defaultSymbol || 'Live Price');
+    const t = d.generated_at
+      ? new Date(d.generated_at).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) + ' UTC'
+      : '';
+    priceBar = `<div class="live-price-bar">
+      <div><div class="lp-label">${label}</div><div class="lp-price">${fmt(d.current_price, 2)}</div></div>
+      ${t ? `<div class="lp-time">Updated ${t}</div>` : ''}
+    </div>`;
+  }
+
+  // SOTD indicator rows
+  let indicatorRows = '';
+  if (isSOTD) {
+    indicatorRows = [
+      d.ema_stack           ? {t: 'EMA Stack',        v: d.ema_stack}           : null,
+      d.rsi_context         ? {t: 'RSI Context',      v: d.rsi_context}         : null,
+      d.atr_context         ? {t: 'ATR / Volatility', v: d.atr_context}         : null,
+      d.one_h_entry_context ? {t: '1H Entry Trigger', v: d.one_h_entry_context} : null,
+    ].filter(Boolean).map(r =>
+      `<div class="reason-row"><div class="rtitle">${r.t}</div><div class="rtext">${esc(r.v)}</div></div>`
+    ).join('');
+  }
+
+  return `<div class="card">
+    <div class="signal-header">
+      <span class="signal-badge ${badgeClass}">${sigIcon} ${sig}</span>
+      ${entryLabel ? `<span class="pill">${esc(entryLabel)}</span>` : ''}
+      ${scoreDisplay}
+      ${convDisplay}
+      ${isSOTD ? `<span class="pill pill-gold">🥇 Signal of the Day</span>` : ''}
+    </div>
+
+    ${priceBar}
+    ${mtfRow}
+    ${renderVerdict(d)}
+    ${renderDynamics(d)}
+
+    ${d.structure_notes ? `<div class="structure-bar">
+      <span class="struct-label ${sc}">${(d.structure || d.daily_structure || '').toUpperCase()}</span>
+      — ${esc(d.structure_notes)}
+    </div>` : ''}
+
+    <div class="levels-grid">
+      <div class="level-box">
+        <div class="lbl">Entry (${d.entry_type || 'Price'})</div>
+        <div class="val ${evClass}">${fmt(d.entry)}</div>
+      </div>
+      <div class="level-box">
+        <div class="lbl">Stop Loss</div>
+        <div class="val val-sl">${fmt(d.stop_loss)}</div>
+      </div>
+      <div class="level-box">
+        <div class="lbl">Take Profit 1</div>
+        <div class="val val-tp1">${fmt(d.tp1)}</div>
+      </div>
+      <div class="level-box">
+        <div class="lbl">Take Profit 2</div>
+        <div class="val val-tp2">${fmt(d.tp2)}</div>
+      </div>
+      <div class="level-box">
+        <div class="lbl">R:R to TP1</div>
+        <div class="val val-rr">${rrFmt(d.rr_tp1)}</div>
+      </div>
+      <div class="level-box">
+        <div class="lbl">R:R to TP2</div>
+        <div class="val val-rr">${rrFmt(d.rr_tp2)}</div>
+      </div>
+    </div>
+
+    <div class="reasons">
+      ${d.entry_reason ? `<div class="reason-row"><div class="rtitle">Entry Reason</div><div class="rtext">${esc(d.entry_reason)}</div></div>` : ''}
+      ${d.sl_reason    ? `<div class="reason-row"><div class="rtitle">SL Rationale</div><div class="rtext">${esc(d.sl_reason)}</div></div>` : ''}
+      ${d.tp_reason    ? `<div class="reason-row"><div class="rtitle">Target Rationale</div><div class="rtext">${esc(d.tp_reason)}</div></div>` : ''}
+      ${indicatorRows}
+    </div>
+
+    ${renderChecklist(d.checklist, d.score)}
+
+    <hr class="divider">
+    ${renderAllSetups(d.all_setups, d.selected_index)}
+    ${renderKeyLevels(d.key_levels)}
+
+    <hr class="divider">
+    ${renderMT5Panel(d, defaultSymbol)}
+  </div>`;
+}
+
+// ── Chart Analysis ────────────────────────────────────────────────────────────
+async function analyzeChart() {
+  const file   = document.getElementById('fileInput').files[0];
+  const symbol = document.getElementById('symbol').value.trim();
+  if (!file || !symbol) return alert('Please select a chart image and enter a symbol.');
+
+  const btn = document.getElementById('analyzeBtn');
+  btn.disabled = true;
+  btn.textContent = 'Fetching live data & analysing…';
+
+  const resDiv = document.getElementById('chart-result');
+  showLoading(resDiv, `Pulling live ${symbol.toUpperCase()} data across Daily · 4H · 1H and scanning setups…`);
+
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    try {
+      const res  = await fetch('/analyze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ image: e.target.result, symbol }),
+      });
+      const data = await res.json();
+      resDiv.innerHTML = renderResult(data, false, symbol.toUpperCase());
+    } catch(err) {
+      resDiv.innerHTML = renderError('Network error: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Analyze Chart';
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+// ── Signal of the Day ─────────────────────────────────────────────────────────
+async function fetchSignalOfDay() {
+  const btn    = document.getElementById('sotdBtn');
+  const resDiv = document.getElementById('sotd-result');
+  btn.disabled = true;
+  btn.textContent = 'Fetching live data…';
+  showLoading(resDiv, 'Pulling live XAUUSD candles · sweeps · exhaustion · EMA/RSI/ATR across D·4H·1H…');
+  try {
+    const res  = await fetch('/signal-of-day');
+    const data = await res.json();
+    resDiv.innerHTML = renderResult(data, true, 'XAUUSD');
+  } catch(err) {
+    resDiv.innerHTML = renderError('Network error: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '⚡ Get Today\'s Signal';
+  }
+}
+</script>
+</body>
+</html>
