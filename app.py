@@ -1,3 +1,31 @@
+# =============================================================================
+# Der-AI | Institutional Market Analysis — UPGRADED BUILD
+#
+# Changes vs. the previous version (see chat for full root-cause analysis):
+#   1. call_groq() now ALWAYS tries GROQ_MODELS in the exact configured order.
+#      The old get_groq_models() discovery call used to silently re-filter/drop
+#      the primary model before it was ever tried if Groq's /models endpoint
+#      didn't happen to list it — that was the actual cause of "it skips model
+#      1 and uses model 3". Discovery is now diagnostic-only (Settings tab).
+#   2. Each model gets its own max_completion_tokens + reasoning_effort
+#      (openai/gpt-oss-120b: 4000 tokens, reasoning_effort='low') instead of a
+#      single 950-token cap, which was starving the reasoning model of room to
+#      finish its JSON output.
+#   3. Every signal is now a genuine resting LIMIT order inside a real
+#      min/max "entry gap" band (get_entry_gap_bounds / compute_default_limit_
+#      entry). The old code capped that band so tight (~0.25% / 0.9 ATR) that
+#      any real pullback level got rejected and silently replaced with a
+#      market-price entry + order_type='MARKET'. That fallback is gone.
+#   4. No more WAIT signals anywhere in the resolved output — every dead end
+#      (missing AI entry, failed structural plan, failed final validation)
+#      now resolves through build_atr_fallback_plan() to a deterministic,
+#      risk-defined BUY/SELL LIMIT instead of surrendering.
+#   5. Added next_level_watch (AI-populated, with a Python-computed fallback)
+#      so each signal also states the next structural level price may
+#      approach beyond TP.
+#   6. Settings tab now shows per-model call diagnostics and a live Groq
+#      /models check, so you can see exactly what happened on any given run.
+# =============================================================================
 import os, json, requests, time, re, random, traceback, uuid, html, base64, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,13 +74,32 @@ MINIMUM_CONFLUENCE_SCORE = 72
 GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 GROQ_MIN_REQUEST_INTERVAL = 3
 GROQ_TOKEN_LIMIT_PER_MINUTE = 1000000
-GROQ_MAX_OUTPUT_TOKENS = 950
-GROQ_ESTIMATED_RESPONSE_TOKENS = GROQ_MAX_OUTPUT_TOKENS
+GROQ_REQUEST_TIMEOUT = 90
+GROQ_MAX_RETRIES_PER_MODEL = 2          # retries on transient errors (timeout/5xx) before moving to the next model
+GROQ_RETRY_BACKOFF_SECONDS = 2.5
+
+# GPT-OSS models on Groq are *reasoning* models: a large share of the completion-token
+# budget is consumed by hidden chain-of-thought before the final JSON is emitted. The old
+# fixed 950-token cap starved openai/gpt-oss-120b of room to finish, so it returned
+# truncated/invalid JSON, which made the loop silently fall through to qwen3-32b — this is
+# why the app looked like it was "skipping" the first model. Each model now gets its own
+# budget and reasoning_effort tuned so the primary model actually completes.
+# Ordering here is authoritative — models are ALWAYS attempted in this exact order.
 GROQ_MODELS = [
-    'openai/gpt-oss-120b',  # Primary: Groq's recommended high-reasoning replacement
-    'openai/gpt-oss-20b',   # Secondary: Lighter/faster GPT OSS fallback
-    'qwen/qwen3-32b'        # Tertiary: Qwen fallback (matches your MARKETANALYSIS.PY slugs)
+    'openai/gpt-oss-120b',  # Primary: Groq's high-reasoning flagship (131K ctx)
+    'openai/gpt-oss-20b',   # Secondary: Lighter/faster GPT-OSS fallback
+    'qwen/qwen3-32b'        # Tertiary: Qwen fallback
 ]
+GROQ_MODEL_CONFIG = {
+    'openai/gpt-oss-120b': {'max_completion_tokens': 4000, 'reasoning_effort': 'low', 'supports_reasoning_effort': True},
+    'openai/gpt-oss-20b':  {'max_completion_tokens': 3200, 'reasoning_effort': 'low', 'supports_reasoning_effort': True},
+    'qwen/qwen3-32b':      {'max_completion_tokens': 2200, 'reasoning_effort': 'none', 'supports_reasoning_effort': True},
+}
+GROQ_DEFAULT_MODEL_CONFIG = {'max_completion_tokens': 2000, 'reasoning_effort': None, 'supports_reasoning_effort': False}
+# Kept only as a legacy default for token-budget estimation; actual requests use the
+# per-model 'max_completion_tokens' above.
+GROQ_MAX_OUTPUT_TOKENS = 4000
+GROQ_ESTIMATED_RESPONSE_TOKENS = GROQ_MAX_OUTPUT_TOKENS
 
 PYTHON_FALLBACK_MODEL = 'Python fallback (rule-based MTF confluence)'
 
@@ -72,6 +119,7 @@ if 'last_groq_request_time' not in st.session_state: st.session_state.last_groq_
 if 'groq_rate_limit_until' not in st.session_state: st.session_state.groq_rate_limit_until = None
 if 'groq_rate_limit_reason' not in st.session_state: st.session_state.groq_rate_limit_reason = ''
 if 'cached_analysis' not in st.session_state: st.session_state.cached_analysis = {}
+if 'last_model_attempts' not in st.session_state: st.session_state.last_model_attempts = {}
 
 def add_notification(note_type, message, symbol=None, signal=None, score=None):
     if 'notifications' not in st.session_state:
@@ -135,7 +183,7 @@ def build_telegram_signal_message(symbol, result):
     signal = normalize_ai_signal(result.get('signal'))
     signal = _escape_telegram_html(signal)
     reasoning = _escape_telegram_html(result.get('reasoning'))
-    order_type = _escape_telegram_html(result.get('order_type', 'MARKET'))
+    order_type = _escape_telegram_html(result.get('order_type', 'LIMIT'))
     model = _escape_telegram_html(result.get('model_used', 'Unknown'))
     tokens = result.get('total_tokens', 'N/A')
     return (
@@ -957,6 +1005,14 @@ def resolve_firm_direction(symbol, picture):
     return firm, notes
 
 def get_pair_config(symbol):
+    # NOTE ON THE LIMIT ZONE: 'min_entry_gap_pct'/'min_entry_gap_atr' set a FLOOR on how far
+    # the entry must sit from live price (so a signal can never be a disguised market order),
+    # while 'max_entry_gap_pct'/'max_entry_points'/'limit_zone_atr' set the CEILING (so the
+    # limit stays realistic and likely to be tagged rather than sitting in no-man's land).
+    # The old ceiling values here were tight enough (0.20-0.30% / ~0.9 ATR) that any genuine
+    # structural pullback (an order block, FVG or swing level a reasonable distance away) got
+    # rejected and silently replaced with a market-price entry. Both bounds are now wider and
+    # symbol-appropriate, and a floor was added that did not exist before.
     base = {
         'digits': 2,
         'tick_size': 0.01,
@@ -968,15 +1024,16 @@ def get_pair_config(symbol):
         'score_floor': MINIMUM_CONFLUENCE_SCORE,
         'candidate_score': MINIMUM_CONFLUENCE_SCORE,
         'cooldown_minutes': 30,
-        'max_entry_gap_pct': 0.0025,
-        'max_entry_points': 10,
+        'min_entry_gap_pct': 0.0009,
+        'min_entry_gap_atr': 0.12,
+        'max_entry_gap_pct': 0.0085,
+        'max_entry_points': 35,
         'min_stop_atr': 1.0,
         'max_stop_atr': 3.0,
         'stop_buffer_atr': 0.25,
         'tp_buffer_atr': 0.12,
-        'market_zone_atr': 0.20,
-        'limit_zone_atr': 0.90,
-        'stop_zone_atr': 0.90,
+        'limit_zone_atr': 2.2,
+        'default_pullback_atr': 0.55,
         'spread_multiplier': 1.5,
     }
     overrides = {
@@ -985,46 +1042,62 @@ def get_pair_config(symbol):
             'tick_size': 0.01,
             'min_dist_pct': 0.0028,
             'max_risk_pct': 0.010,
-            'max_entry_gap_pct': 0.003,
-            'max_entry_points': 10,
+            'min_entry_gap_pct': 0.0012,
+            'min_entry_gap_atr': 0.12,
+            'max_entry_gap_pct': 0.009,
+            'max_entry_points': 35,
             'min_stop_atr': 1.2,
             'target_rr': 2.0,
             'max_rr': 3.0,
+            'limit_zone_atr': 2.2,
+            'default_pullback_atr': 0.55,
         },
         'EURUSD': {
             'digits': 5,
             'tick_size': 0.00001,
             'min_dist_pct': 0.0012,
             'max_risk_pct': 0.004,
-            'max_entry_gap_pct': 0.002,
-            'max_entry_points': 0.0025,
+            'min_entry_gap_pct': 0.0007,
+            'min_entry_gap_atr': 0.12,
+            'max_entry_gap_pct': 0.006,
+            'max_entry_points': 0.0075,
             'min_stop_atr': 1.0,
             'target_rr': 2.0,
             'max_rr': 3.0,
             'max_stop_atr': 2.5,
+            'limit_zone_atr': 2.2,
+            'default_pullback_atr': 0.55,
         },
         'BTCUSD': {
             'digits': 2,
             'tick_size': 0.01,
             'min_dist_pct': 0.006,
             'max_risk_pct': 0.015,
-            'max_entry_gap_pct': 0.004,
-            'max_entry_points': 150,
+            'min_entry_gap_pct': 0.0025,
+            'min_entry_gap_atr': 0.12,
+            'max_entry_gap_pct': 0.014,
+            'max_entry_points': 450,
             'min_stop_atr': 1.2,
             'target_rr': 2.0,
             'max_rr': 3.0,
             'max_stop_atr': 3.5,
+            'limit_zone_atr': 2.2,
+            'default_pullback_atr': 0.55,
         },
         'US30': {
             'digits': 1,
             'tick_size': 0.1,
             'min_dist_pct': 0.004,
             'max_risk_pct': 0.010,
-            'max_entry_gap_pct': 0.003,
-            'max_entry_points': 120,
+            'min_entry_gap_pct': 0.0015,
+            'min_entry_gap_atr': 0.12,
+            'max_entry_gap_pct': 0.009,
+            'max_entry_points': 350,
             'min_stop_atr': 1.0,
             'target_rr': 2.0,
             'max_rr': 3.0,
+            'limit_zone_atr': 2.2,
+            'default_pullback_atr': 0.55,
         },
     }
     return {**base, **overrides.get(symbol, {})}
@@ -1347,22 +1420,23 @@ def _desk_position_lock(symbol, proposed, current_price):
     except Exception:
         return None
 
-def build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr, pair_config):
+def build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=None):
+    """Build genuine LIMIT-order candidate plans the AI can choose from or refine. These are
+    pullback entries anchored to real structure (order block / FVG / swing / VWAP) inside the
+    institutional limit-order band — never a plan sitting at the live price, which previously
+    biased the AI toward proposing market-style entries."""
     plans = []
     try:
         current_price = float(current_price)
     except Exception:
         return plans
-    max_gap = min(
-        float(pair_config.get('max_entry_points', 10) or 10),
-        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
-    )
-    if atr:
-        max_gap = min(max_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
     for signal in ('BUY', 'SELL'):
+        candidate_entry = compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=vwap)
+        if not candidate_entry:
+            continue
         market_plan = build_structural_plan_v2(
             signal=signal,
-            entry=current_price,
+            entry=candidate_entry,
             current_price=current_price,
             swings=swings,
             order_blocks=order_blocks,
@@ -1372,7 +1446,7 @@ def build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, at
             market_df=None
         )
         if market_plan:
-            market_plan['plan'] = 'MARKET'
+            market_plan['plan'] = 'LIMIT'
             market_plan['signal'] = signal
             plans.append(market_plan)
     return plans
@@ -1596,24 +1670,95 @@ def round_price(price, pair_config):
     except Exception:
         return None
 
-def infer_order_type(signal, entry, current_price, pair_config, atr=None):
-    if signal not in ('BUY', 'SELL') or entry is None or current_price is None:
-        return 'MARKET'
+def get_entry_gap_bounds(current_price, atr, pair_config):
+    """Return (min_gap, max_gap): the institutional 'limit zone' band an entry must sit in.
+
+    min_gap guarantees a signal can never be a disguised market order — the entry must be a
+    meaningful distance from live price. max_gap keeps the limit realistic (still likely to be
+    tagged) rather than sitting so far away it may never fill. Both scale with the symbol's ATR
+    so the band automatically widens in high-volatility conditions and tightens when the market
+    is quiet.
+    """
     try:
-        entry = float(entry)
         current_price = float(current_price)
     except Exception:
-        return 'MARKET'
-    tick = float(pair_config.get('tick_size', 0.01) or 0.01)
-    market_tolerance = max(
-        tick * 3.0,
-        float(atr or 0.0) * float(pair_config.get('market_zone_atr', 0.20))
+        current_price = 0.0
+    atr = float(atr) if atr else 0.0
+    min_gap = max(
+        float(pair_config.get('tick_size', 0.01) or 0.01) * 5.0,
+        current_price * float(pair_config.get('min_entry_gap_pct', 0.0009)),
+        atr * float(pair_config.get('min_entry_gap_atr', 0.12))
     )
-    if abs(entry - current_price) <= market_tolerance:
-        return 'MARKET'
+    max_gap = min(
+        float(pair_config.get('max_entry_points', 35) or 35),
+        current_price * float(pair_config.get('max_entry_gap_pct', 0.0085) or 0.0085)
+    )
+    if atr:
+        max_gap = min(max_gap, atr * float(pair_config.get('limit_zone_atr', 2.2)))
+    if max_gap < min_gap:
+        max_gap = min_gap * 1.5
+    return min_gap, max_gap
+
+def infer_order_type(signal, entry=None, current_price=None, pair_config=None, atr=None):
+    # The desk only ever works resting LIMIT orders — never chases price at market and never
+    # uses breakout STOP entries. This mirrors "buy limit / sell limit" institutional execution:
+    # the AI must wait for price to retrace to its stated level before the order can fill.
+    return 'LIMIT'
+
+def compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=None):
+    """Fallback limit-entry generator used whenever the AI's proposed entry is missing, invalid,
+    or outside the reasonable limit band. Instead of snapping to market price (the old
+    behaviour), this looks for the nearest genuine structural pullback level — an order block,
+    a fair value gap, a recent swing, or VWAP — that sits inside [min_gap, max_gap] from live
+    price. If nothing structural qualifies, it anchors a fixed ATR-based pullback distance so
+    the entry is still always a real limit, never the current price.
+    """
+    try:
+        current_price = float(current_price)
+    except Exception:
+        return None
+    if signal not in ('BUY', 'SELL'):
+        return None
+    atr = float(atr) if atr else current_price * float(pair_config.get('min_dist_pct', 0.0015))
+    min_gap, max_gap = get_entry_gap_bounds(current_price, atr, pair_config)
+    order_blocks = order_blocks or []
+    fvgs = fvgs or []
+    swings = swings or {}
+    candidates = []
     if signal == 'BUY':
-        return 'LIMIT' if entry < current_price else 'STOP'
-    return 'LIMIT' if entry > current_price else 'STOP'
+        candidates.extend(float(ob.get('price')) for ob in order_blocks
+                           if ob.get('type') == 'BULLISH_OB' and ob.get('price') is not None and float(ob.get('price')) < current_price)
+        candidates.extend(
+            (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0
+            for fvg in fvgs
+            if fvg.get('type') == 'BULLISH_FVG' and fvg.get('top') is not None and fvg.get('bottom') is not None
+            and (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0 < current_price
+        )
+        candidates.extend(float(x) for x in swings.get('recent_swing_lows', []) if x is not None and float(x) < current_price)
+        if vwap is not None and float(vwap) < current_price:
+            candidates.append(float(vwap))
+        in_band = [c for c in candidates if min_gap <= (current_price - c) <= max_gap]
+        if in_band:
+            return max(in_band)  # closest qualifying pullback level to live price
+        default_gap = min(max(atr * float(pair_config.get('default_pullback_atr', 0.55)), min_gap), max_gap)
+        return current_price - default_gap
+    else:
+        candidates.extend(float(ob.get('price')) for ob in order_blocks
+                           if ob.get('type') == 'BEARISH_OB' and ob.get('price') is not None and float(ob.get('price')) > current_price)
+        candidates.extend(
+            (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0
+            for fvg in fvgs
+            if fvg.get('type') == 'BEARISH_FVG' and fvg.get('top') is not None and fvg.get('bottom') is not None
+            and (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0 > current_price
+        )
+        candidates.extend(float(x) for x in swings.get('recent_swing_highs', []) if x is not None and float(x) > current_price)
+        if vwap is not None and float(vwap) > current_price:
+            candidates.append(float(vwap))
+        in_band = [c for c in candidates if min_gap <= (c - current_price) <= max_gap]
+        if in_band:
+            return min(in_band)  # closest qualifying pullback level to live price
+        default_gap = min(max(atr * float(pair_config.get('default_pullback_atr', 0.55)), min_gap), max_gap)
+        return current_price + default_gap
 
 def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair_config):
     try:
@@ -1625,25 +1770,19 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         return False, "Missing or non-numeric entry/SL/TP."
     if entry <= 0 or sl <= 0 or tp <= 0 or current_price <= 0:
         return False, "Entry, SL, TP, and current price must be positive."
-    max_entry_gap = min(
-        float(pair_config.get('max_entry_points', 10) or 10),
-        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
-    )
-    if atr:
-        max_entry_gap = min(max_entry_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
-    if abs(entry - current_price) > max_entry_gap:
-        return False, f"Entry too far from live price. Gap={abs(entry - current_price):.6f}, max={max_entry_gap:.6f}."
+    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr, pair_config)
+    gap = abs(entry - current_price)
+    if gap > max_entry_gap:
+        return False, f"Entry too far from live price. Gap={gap:.6f}, max={max_entry_gap:.6f}."
+    if gap < min_entry_gap:
+        return False, f"Entry too close to live price to qualify as a genuine limit order. Gap={gap:.6f}, min={min_entry_gap:.6f}."
     order_type = str(order_type or '').upper()
-    if order_type == 'LIMIT':
-        if signal == 'BUY' and entry >= current_price:
-            return False, "BUY LIMIT must be below current price."
-        if signal == 'SELL' and entry <= current_price:
-            return False, "SELL LIMIT must be above current price."
-    if order_type == 'STOP':
-        if signal == 'BUY' and entry <= current_price:
-            return False, "BUY STOP must be above current price."
-        if signal == 'SELL' and entry >= current_price:
-            return False, "SELL STOP must be below current price."
+    if order_type != 'LIMIT':
+        return False, f"Only LIMIT orders are permitted; got {order_type or 'UNSET'}."
+    if signal == 'BUY' and entry >= current_price:
+        return False, "BUY LIMIT must be below current price."
+    if signal == 'SELL' and entry <= current_price:
+        return False, "SELL LIMIT must be above current price."
     min_stop_distance = max(
         abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
         float(atr or 0.0) * float(pair_config.get('min_stop_atr', 1.0))
@@ -1684,6 +1823,44 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         return False, f"RR too high / TP too far from entry. RR={rr:.2f}, max={max_rr:.2f}."
     return True, "Valid"
 
+def build_atr_fallback_plan(signal, entry, pair_config, atr):
+    """Deterministic, always-valid SL/TP builder used only when no structural anchor (order
+    block, FVG, swing) is usable. Sizes risk purely from ATR/min-distance rules so a signal
+    is always produced — this desk never returns WAIT for lack of a plan."""
+    entry = float(entry)
+    atr = float(atr) if atr else abs(entry) * float(pair_config.get('min_dist_pct', 0.0015))
+    min_stop_distance = max(
+        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
+        atr * float(pair_config.get('min_stop_atr', 1.0))
+    )
+    max_stop_distance = min(
+        abs(entry) * float(pair_config.get('max_risk_pct', 0.008)),
+        atr * float(pair_config.get('max_stop_atr', 3.0))
+    )
+    if max_stop_distance < min_stop_distance:
+        max_stop_distance = min_stop_distance * 1.5
+    risk = min(max(min_stop_distance * 1.15, min_stop_distance), max_stop_distance)
+    target_rr = max(float(pair_config.get('target_rr', 2.0)), float(pair_config.get('min_rr', 1.3)))
+    target_rr = min(target_rr, float(pair_config.get('max_rr', 3.0)))
+    reward = risk * target_rr
+    if signal == 'BUY':
+        sl = entry - risk
+        tp = entry + reward
+    else:
+        sl = entry + risk
+        tp = entry - reward
+    rr = round(reward / risk, 2) if risk > 0 else 0
+    return {
+        'entry': round_price(entry, pair_config),
+        'stop_loss': round_price(sl, pair_config),
+        'take_profit': [round_price(tp, pair_config)],
+        'exhaustion_target': round_price(tp, pair_config),
+        'rr_ratio': rr,
+        'risk_band': round_price(risk, pair_config),
+        'order_type': 'LIMIT',
+        'levels_source': 'PYTHON_ATR_FALLBACK',
+    }
+
 def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, fvgs, atr, pair_config, market_df=None):
     if not isinstance(analysis, dict):
         return analysis
@@ -1699,21 +1876,34 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
         entry = float(entry)
     except Exception:
         entry = None
-    max_entry_gap = min(
-        float(pair_config.get('max_entry_points', 10) or 10),
-        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
-    )
-    if atr:
-        max_entry_gap = min(max_entry_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
-    if entry is None or entry <= 0 or abs(entry - current_price) > max_entry_gap:
-        entry = current_price
-        analysis['order_type'] = 'MARKET'
+    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr, pair_config)
+    gap = abs(entry - current_price) if entry else None
+    needs_recompute = entry is None or entry <= 0 or gap is None or gap > max_entry_gap or gap < min_entry_gap
+    # Directional sanity: a BUY entry must sit below live price and a SELL entry above it,
+    # otherwise the AI proposed a market/stop-style level, which is not permitted here.
+    if entry is not None and entry > 0:
+        if signal == 'BUY' and entry >= current_price:
+            needs_recompute = True
+        if signal == 'SELL' and entry <= current_price:
+            needs_recompute = True
+    if needs_recompute:
+        vwap = None
+        try:
+            if market_df is not None and not market_df.empty:
+                micro = calculate_microstructure(market_df)
+                vwap = micro.get('vwap')
+        except Exception:
+            vwap = None
+        computed_entry = compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=vwap)
+        entry = computed_entry if computed_entry else (
+            current_price - max(min_entry_gap, (atr or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
+            if signal == 'BUY' else
+            current_price + max(min_entry_gap, (atr or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
+        )
+        analysis['order_type'] = 'LIMIT'
         analysis['levels_source'] = 'PYTHON'
-        add_python_validation_note(analysis, "Entry was re-anchored to live price because the proposed entry was missing, invalid, or too far from market.")
-    inferred_order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
-    requested_order_type = str(analysis.get('order_type') or '').upper()
-    if requested_order_type not in ('MARKET', 'LIMIT', 'STOP') or requested_order_type != inferred_order_type:
-        analysis['order_type'] = inferred_order_type
+        add_python_validation_note(analysis, "Entry was re-anchored to the nearest qualifying structural pullback level (order block / FVG / swing / VWAP) because the proposed entry was missing, too close to a market order, or outside the reasonable limit-order band.")
+    analysis['order_type'] = 'LIMIT'
     canonical_plan = build_structural_plan_v2(
         signal=signal,
         entry=entry,
@@ -1758,10 +1948,12 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
             market_df=market_df
         )
         if not plan:
-            analysis['signal'] = 'WAIT'
-            analysis['confidence'] = 'LOW'
-            analysis['rejection_reason'] = f"No executable structural plan. Level check failed: {reason}"
-            return analysis
+            # Last-resort deterministic ATR-based plan. No WAIT signals are produced by this
+            # desk — if no structural anchor is usable, a clean risk-defined limit trade is
+            # built directly from volatility so the analysis always resolves to an executable
+            # BUY/SELL limit.
+            plan = build_atr_fallback_plan(signal, entry, pair_config, atr)
+            add_python_validation_note(analysis, f"No structural SL/TP anchor was usable ({reason}); levels were built directly from ATR risk sizing instead.")
         analysis.update(plan)
     analysis['entry'] = round_price(analysis.get('entry'), pair_config)
     analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
@@ -1785,10 +1977,14 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
         pair_config=pair_config
     )
     if not ok_final:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = f"Final level validation failed: {reason_final}"
-        return analysis
+        # Deterministic safety net: rebuild from ATR risk sizing directly off the (already
+        # band-validated) entry rather than surrendering to a WAIT signal.
+        plan = build_atr_fallback_plan(analysis.get('signal'), final_entry, pair_config, atr)
+        analysis.update(plan)
+        analysis['entry'] = round_price(analysis.get('entry'), pair_config)
+        analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
+        analysis['take_profit'] = [round_price(x, pair_config) for x in analysis.get('take_profit', []) if x is not None]
+        add_python_validation_note(analysis, f"Final level validation rebuilt the plan from ATR risk sizing (previous levels failed: {reason_final}).")
     entry_f = float(analysis['entry'])
     sl_f = float(analysis['stop_loss'])
     tp_f = float(analysis['take_profit'][0])
@@ -2226,6 +2422,14 @@ def is_groq_rate_limited():
     return retry_until is not None and datetime.now() < retry_until
 
 def get_groq_models(api_key):
+    """Diagnostic helper only. This used to also RE-ORDER/FILTER the models actually called,
+    which is what let the primary model silently disappear: if Groq's /models discovery
+    endpoint didn't happen to list 'openai/gpt-oss-120b' for this account at that moment
+    (propagation lag, transient discovery error, preview-model visibility, etc.), the model
+    was quietly dropped from the list before it was ever tried. call_groq() no longer uses
+    this to decide which models to call — GROQ_MODELS is always tried in its literal order.
+    This function is kept only so the Settings tab can show what Groq currently reports as
+    available, for debugging."""
     try:
         response = requests.get(
             f"{GROQ_API_URL.rsplit('/chat/completions', 1)[0]}/models",
@@ -2233,23 +2437,28 @@ def get_groq_models(api_key):
             timeout=20
         )
         if response.status_code != 200:
-            print(f"⚠️ Groq model discovery failed: HTTP {response.status_code}")
-            return GROQ_MODELS
+            return {'ok': False, 'reason': f"HTTP {response.status_code}", 'available': []}
         payload = response.json()
         available = [item.get('id') for item in payload.get('data', []) if item.get('id')]
-        preferred = [model for model in GROQ_MODELS if model in available]
-        additional = [
-            model for model in available
-            if model not in preferred
-            and not any(blocked in model.lower() for blocked in ('whisper', 'guard', 'safety', 'tts', 'distil'))
-        ]
-        models = preferred + additional
-        return models or GROQ_MODELS
+        return {'ok': True, 'available': available}
     except Exception as exc:
-        print(f"⚠️ Groq model discovery exception: {exc}")
-        return GROQ_MODELS
+        return {'ok': False, 'reason': str(exc), 'available': []}
 
-def call_groq(system_prompt, user_content, max_tokens=GROQ_MAX_OUTPUT_TOKENS, retry_count=0, estimated_tokens=None, image_b64=None, image_mime_type='image/png'):
+def is_model_cooling_down(model):
+    cooldowns = st.session_state.setdefault('groq_model_cooldowns', {})
+    until = cooldowns.get(model)
+    return until is not None and datetime.now() < until
+
+def set_model_cooldown(model, seconds):
+    cooldowns = st.session_state.setdefault('groq_model_cooldowns', {})
+    cooldowns[model] = datetime.now() + timedelta(seconds=max(1, int(seconds)))
+
+# HTTP statuses that mean "this model id is genuinely unusable right now" (deprecated,
+# decommissioned, not entitled, bad request shape) — retrying the SAME model won't help, so we
+# move straight to the next model in the list without burning retries on it.
+_GROQ_NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 422}
+
+def call_groq(system_prompt, user_content, max_tokens=None, retry_count=0, estimated_tokens=None, image_b64=None, image_mime_type='image/png'):
     api_key = get_secret("GROQ_API_KEY", "").strip()
     if not api_key:
         print("❌ GROQ_API_KEY is missing from st.secrets!")
@@ -2284,146 +2493,163 @@ def call_groq(system_prompt, user_content, max_tokens=GROQ_MAX_OUTPUT_TOKENS, re
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
-    request_started = False
     model_errors = []
-    models = get_groq_models(api_key)
-    for model in models:
-        try:
-            # Rate limit checks
-            if is_groq_rate_limited():
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                        "rejection_reason": "RATE_LIMIT", "model_used": model,
-                        "estimated_tokens": estimated_tokens, "api_status": "RATE_LIMIT"}
+    attempts_log = []
+    # GROQ_MODELS is tried in this exact order, every time. No discovery-based filtering.
+    for model in GROQ_MODELS:
+        model_cfg = GROQ_MODEL_CONFIG.get(model, GROQ_DEFAULT_MODEL_CONFIG)
+        model_max_tokens = int(max_tokens) if max_tokens else int(model_cfg['max_completion_tokens'])
 
-            time_since_last = (datetime.now() - st.session_state.last_groq_request_time).total_seconds() if st.session_state.last_groq_request_time else None
-            if not request_started and time_since_last is not None and time_since_last < GROQ_MIN_REQUEST_INTERVAL:
-                wait_time = int(GROQ_MIN_REQUEST_INTERVAL - time_since_last)
-                st.session_state.groq_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                        "rejection_reason": "RATE_LIMIT", "model_used": model,
-                        "estimated_tokens": estimated_tokens, "api_status": "SPACING_LIMIT"}
+        if is_model_cooling_down(model):
+            reason = f"{model}: still cooling down from a recent rate limit"
+            model_errors.append(reason)
+            attempts_log.append({'model': model, 'status': 'SKIPPED_COOLDOWN'})
+            continue
 
-            if not reserve_groq_tokens(estimated_tokens):
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                        "rejection_reason": "RATE_LIMIT", "model_used": model,
-                        "estimated_tokens": estimated_tokens, "api_status": "TOKEN_BUDGET"}
-
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": parts}],
-                "temperature": 0.2,
-                "max_tokens": min(int(max_tokens), GROQ_MAX_OUTPUT_TOKENS),
-                "response_format": {"type": "json_object"}
-            }
-
-            print(f"🚀 Calling {model} via Groq Chat Completions API...")
-
-            res = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=120)
-            st.session_state.last_groq_request_time = datetime.now()
-            request_started = True
-
-            if res.status_code == 429:
-                retry_after = int(res.headers.get('Retry-After', '60')) if res.headers.get('Retry-After') else 60
-                error_text = res.text[:500]
-                print(f"⏳ 429 Rate limit. Retry after {retry_after}s")
-                model_errors.append(f"{model}: HTTP 429 {error_text}")
-                st.session_state.groq_rate_limit_until = datetime.now() + timedelta(seconds=retry_after)
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                    "rejection_reason": f"RATE_LIMIT: {error_text}", "model_used": model,
-                    "estimated_tokens": estimated_tokens, "api_status": "RATE_LIMIT_429",
-                    "raw_output": error_text}
-
-            if res.status_code != 200:
-                error_text = res.text[:500]
-                print(f"❌ API Error {res.status_code}: {error_text}")
-                model_errors.append(f"{model}: HTTP {res.status_code} {error_text}")
-                # Try next model
-                continue
-
-            res_data = res.json()
-
-            # Extract token usage
-            usage = res_data.get("usage", {})
-            prompt_tokens = usage.get("prompt_tokens", 0)
-            completion_tokens = usage.get("completion_tokens", 0)
-            total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
-
-            choices = res_data.get("choices", [])
-            if not choices:
-                print(f"❌ No choices in response: {str(res_data)[:300]}")
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                        "rejection_reason": "No choices returned",
-                        "model_used": model, "api_status": "NO_CANDIDATES",
-                        "total_tokens": total_tokens, "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens}
-
-            content = choices[0].get("message", {}).get("content", "")
-            if isinstance(content, list):
-                content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
-            content = str(content).strip()
-            print(f"✅ Got response from {model} | Tokens: {total_tokens}")
-
-            # Clean markdown
-            content = re.sub(r'^```(?:json)?\s*', '', content, flags=re.IGNORECASE).strip()
-            content = re.sub(r'\s*```$', '', content).strip()
-
-            # Parse JSON
+        succeeded = False
+        for attempt in range(GROQ_MAX_RETRIES_PER_MODEL + 1):
             try:
-                cleaned = re.sub(r',\s*([}\]])', r'\1', content)
-                result = json.loads(cleaned)
-            except json.JSONDecodeError:
-                # Try extracting JSON substring
-                first = content.find('{')
-                last = content.rfind('}')
-                if first != -1 and last != -1 and last > first:
-                    substring = content[first:last+1]
-                    try:
-                        substring_clean = re.sub(r',\s*([}\]])', r'\1', substring)
-                        result = json.loads(substring_clean)
-                    except Exception:
-                        print(f"❌ JSON parse failed. Raw: {content[:200]}")
-                        return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                                "rejection_reason": "PARSE_ERROR",
-                                "raw_output": content[:2000], "model_used": model,
-                                "api_status": "PARSE_ERROR",
-                                "total_tokens": total_tokens, "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens}
-                else:
+                time_since_last = (datetime.now() - st.session_state.last_groq_request_time).total_seconds() if st.session_state.last_groq_request_time else None
+                if time_since_last is not None and time_since_last < GROQ_MIN_REQUEST_INTERVAL:
+                    time.sleep(max(0.0, GROQ_MIN_REQUEST_INTERVAL - time_since_last))
+
+                if not reserve_groq_tokens(estimated_tokens):
+                    attempts_log.append({'model': model, 'status': 'TOKEN_BUDGET'})
                     return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                            "rejection_reason": "PARSE_ERROR",
-                            "raw_output": content[:2000], "model_used": model,
-                            "api_status": "PARSE_ERROR",
-                            "total_tokens": total_tokens}
+                            "rejection_reason": "RATE_LIMIT", "model_used": model,
+                            "estimated_tokens": estimated_tokens, "api_status": "TOKEN_BUDGET",
+                            "model_attempts": attempts_log}
 
-            result['model_used'] = model
-            result['estimated_tokens'] = estimated_tokens
-            result['total_tokens'] = total_tokens
-            result['prompt_tokens'] = prompt_tokens
-            result['completion_tokens'] = completion_tokens
-            result['api_status'] = 'SUCCESS'
-            st.session_state.groq_tokens_used += total_tokens
-            st.session_state.groq_rate_limit_until = None
-            st.session_state.groq_rate_limit_reason = ''
-            return result
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": parts}],
+                    "temperature": 0.2,
+                    "max_completion_tokens": model_max_tokens,
+                    "response_format": {"type": "json_object"}
+                }
+                if model_cfg.get('supports_reasoning_effort') and model_cfg.get('reasoning_effort'):
+                    payload["reasoning_effort"] = model_cfg['reasoning_effort']
+                    payload["include_reasoning"] = False
 
-        except requests.exceptions.Timeout:
-            print(f"⏰ Timeout calling {model}")
-            model_errors.append(f"{model}: request timed out")
-            continue
-        except Exception as e:
-            print(f"❌ Exception calling {model}: {str(e)}")
-            model_errors.append(f"{model}: {str(e)}")
-            if model == models[-1]:
-                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-                        "rejection_reason": f"Error: {str(e)}", "model_used": "None",
-                        "api_status": "EXCEPTION", "estimated_tokens": estimated_tokens}
-            continue
+                print(f"🚀 Calling {model} (attempt {attempt + 1}/{GROQ_MAX_RETRIES_PER_MODEL + 1}, max_completion_tokens={model_max_tokens})...")
+
+                res = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=GROQ_REQUEST_TIMEOUT)
+                st.session_state.last_groq_request_time = datetime.now()
+
+                if res.status_code == 429:
+                    retry_after = int(res.headers.get('Retry-After', '20')) if res.headers.get('Retry-After') else 20
+                    error_text = res.text[:500]
+                    print(f"⏳ 429 on {model}. Cooling down {retry_after}s and trying the next model.")
+                    model_errors.append(f"{model}: HTTP 429 {error_text}")
+                    attempts_log.append({'model': model, 'status': 'RATE_LIMIT_429'})
+                    set_model_cooldown(model, retry_after)
+                    break  # try the next model in the list rather than aborting entirely
+
+                if res.status_code in _GROQ_NON_RETRYABLE_STATUSES:
+                    error_text = res.text[:500]
+                    print(f"❌ {model} unusable: HTTP {res.status_code}: {error_text}")
+                    model_errors.append(f"{model}: HTTP {res.status_code} {error_text}")
+                    attempts_log.append({'model': model, 'status': f'HTTP_{res.status_code}'})
+                    break  # this model id itself is the problem; retrying won't help
+
+                if res.status_code != 200:
+                    error_text = res.text[:500]
+                    print(f"⚠️ {model} transient error HTTP {res.status_code}: {error_text}")
+                    model_errors.append(f"{model}: HTTP {res.status_code} {error_text}")
+                    attempts_log.append({'model': model, 'status': f'HTTP_{res.status_code}_RETRY'})
+                    if attempt < GROQ_MAX_RETRIES_PER_MODEL:
+                        time.sleep(GROQ_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                        continue
+                    break
+
+                res_data = res.json()
+                usage = res_data.get("usage", {})
+                prompt_tokens = usage.get("prompt_tokens", 0)
+                completion_tokens = usage.get("completion_tokens", 0)
+                total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+
+                choices = res_data.get("choices", [])
+                if not choices:
+                    print(f"❌ No choices from {model}: {str(res_data)[:300]}")
+                    model_errors.append(f"{model}: no choices returned")
+                    attempts_log.append({'model': model, 'status': 'NO_CANDIDATES'})
+                    break
+
+                message = choices[0].get("message", {})
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+                content = str(content).strip()
+                finish_reason = choices[0].get("finish_reason")
+                print(f"✅ Got response from {model} | Tokens: {total_tokens} (completion {completion_tokens}/{model_max_tokens}) | finish_reason={finish_reason}")
+
+                content = re.sub(r'^```(?:json)?\s*', '', content, flags=re.IGNORECASE).strip()
+                content = re.sub(r'\s*```$', '', content).strip()
+
+                if not content:
+                    reason = "Empty content"
+                    if finish_reason == 'length':
+                        reason = "Response was cut off before any JSON was produced (max_completion_tokens too low for this model/prompt)."
+                    print(f"❌ {model}: {reason}")
+                    model_errors.append(f"{model}: {reason}")
+                    attempts_log.append({'model': model, 'status': 'EMPTY_CONTENT'})
+                    break
+
+                try:
+                    cleaned = re.sub(r',\s*([}\]])', r'\1', content)
+                    result = json.loads(cleaned)
+                except json.JSONDecodeError:
+                    first = content.find('{')
+                    last = content.rfind('}')
+                    result = None
+                    if first != -1 and last != -1 and last > first:
+                        substring = content[first:last + 1]
+                        try:
+                            substring_clean = re.sub(r',\s*([}\]])', r'\1', substring)
+                            result = json.loads(substring_clean)
+                        except Exception:
+                            result = None
+                    if result is None:
+                        print(f"❌ JSON parse failed on {model}. Raw: {content[:200]}")
+                        model_errors.append(f"{model}: PARSE_ERROR")
+                        attempts_log.append({'model': model, 'status': 'PARSE_ERROR', 'finish_reason': finish_reason})
+                        # Try the next model instead of giving up entirely.
+                        break
+
+                result['model_used'] = model
+                result['estimated_tokens'] = estimated_tokens
+                result['total_tokens'] = total_tokens
+                result['prompt_tokens'] = prompt_tokens
+                result['completion_tokens'] = completion_tokens
+                result['api_status'] = 'SUCCESS'
+                result['model_attempts'] = attempts_log + [{'model': model, 'status': 'SUCCESS'}]
+                st.session_state.groq_tokens_used += total_tokens
+                st.session_state.groq_rate_limit_reason = ''
+                succeeded = True
+                return result
+
+            except requests.exceptions.Timeout:
+                print(f"⏰ Timeout calling {model} (attempt {attempt + 1})")
+                model_errors.append(f"{model}: request timed out")
+                attempts_log.append({'model': model, 'status': 'TIMEOUT'})
+                if attempt < GROQ_MAX_RETRIES_PER_MODEL:
+                    time.sleep(GROQ_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                break
+            except Exception as e:
+                print(f"❌ Exception calling {model}: {str(e)}")
+                model_errors.append(f"{model}: {str(e)}")
+                attempts_log.append({'model': model, 'status': f'EXCEPTION: {e}'})
+                break
+        if succeeded:
+            break
 
     return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW",
-            "rejection_reason": "Error: all Groq models failed. " + " | ".join(model_errors[-3:]),
+            "rejection_reason": "Error: all Groq models failed. " + " | ".join(model_errors[-4:]),
             "model_used": "None", "api_status": "ALL_MODELS_FAILED",
             "estimated_tokens": estimated_tokens,
-            "raw_output": "\n".join(model_errors[-3:])}
+            "model_attempts": attempts_log,
+            "raw_output": "\n".join(model_errors[-4:])}
 
 def build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, candles=None, phase_context=None, live_price=None, htf_context=None, picture=None, firm=None, firm_notes=None, learning=None, historical_context=None):
     if not st.session_state.get("_upgrade_fallback_warned"):
@@ -2562,30 +2788,31 @@ PYTHON DIRECTIONAL LEDGER:
 {directional_ledger}
 FIRM DESK BIAS (HTF-FIRST WITH HYSTERESIS):
 {firm_bias}
-MAX ENTRY DISTANCE FROM LIVE PRICE:
+ENTRY GAP RULE (institutional limit-order band, hard-enforced in Python after you answer):
 {max_entry_distance}
-PYTHON CANDIDATE EXECUTION PLANS:
+PYTHON CANDIDATE LIMIT-ENTRY PLANS (pullback levels you may use as-is or refine):
 {candidate_levels}
 
 DECISION RULES:
 1. Use every supplied input: live quote, all timeframes, RSI/divergence, VWAP, RVOL, DXY, SMC structure, zones, volatility, candles and screenshot.
-2. Set market_state to continuation, reversal, exhaustion, trend or coiling. Choose BUY or SELL only; never output WAIT.
+2. Set market_state to continuation, reversal, exhaustion, trend or coiling. Choose BUY or SELL only; never output WAIT — this desk always resolves to an executable trade.
 3. Decide direction in this order: H4/H1 trend, sweep plus divergence, premium/discount, then VWAP/momentum. Explain any override.
-4. Treat the live quote as authoritative. Use the supplied Python candidate plan when suitable and keep entry within MAX ENTRY DISTANCE.
+4. This desk trades ONLY resting limit orders. The live quote is context for where price is now, never the entry. You must select or build a pullback level the market has to retrace to before the order fills — an order block, FVG, VWAP, premium/discount boundary, swing retracement or session level — and it must sit inside the ENTRY GAP RULE band above (far enough from live price to be a genuine limit, close enough to realistically get tagged). Prefer the supplied PYTHON CANDIDATE LIMIT-ENTRY PLANS when one fits; refine the level only when structure clearly supports a better one, still inside the band.
 5. Prefer BUY in discount and SELL in premium, but follow a clearly confirmed sweep/reversal when stronger.
 6. Describe bullish and bearish evidence separately; signal must match the stronger side.
 7. Use DXY as a macro filter for XAUUSD, EURUSD and BTCUSD. Contradiction reduces confidence but does not automatically reverse direction.
-8. Choose MARKET, LIMIT or STOP correctly: BUY LIMIT below/BUY STOP above market; SELL LIMIT above/SELL STOP below market.
-9. Set an exhaustion_target at the most realistic opposing range/liquidity extreme that the move can reach before stalling. Use it as TP. Put SL beyond clear invalidation with ATR room; never guarantee a target, and reject levels that violate minimum 1.5 R:R or maximum risk.
-10. Keep all numbers identical across entry, stop_loss, take_profit and order_description.
+8. order_type is always "LIMIT": BUY LIMIT must sit below the live quote, SELL LIMIT must sit above it. Never propose an entry at or within a hair of the live price — that is a market order in disguise and will be rejected and rebuilt by the execution layer.
+9. Set an exhaustion_target at the most realistic opposing range/liquidity extreme that the move can reach before stalling, measured FROM THE LIMIT ENTRY, not from the live price. Use it as TP. Put SL beyond clear invalidation with ATR room; never guarantee a target, and reject levels that violate minimum 1.5 R:R or maximum risk.
+10. Keep all numbers identical across entry, stop_loss, take_profit and order_description — and make sure the written reasoning explains the SAME entry/SL/TP numbers you output, not a different price you considered along the way.
 11. If the screenshot is usable, identify visible support, resistance, liquidity, trendlines and patterns in visual_levels; otherwise say unavailable.
-12. Be concise but specific: reasoning must mention HTF bias, key evidence, macro, momentum/volume, entry anchor, invalidation, target and risk. Complete valid JSON before adding detail.
+12. Also populate "next_level_watch": the next key structural level beyond your take_profit in the trade direction (the level price is likely to approach next if the setup keeps running), with a one-line reason it matters.
+13. Be concise but specific: reasoning must mention HTF bias, key evidence, macro, momentum/volume, entry anchor, invalidation, target, risk, and why the entry is a genuine pullback rather than a chase. Complete valid JSON before adding detail.
 
 ENTRY EXECUTION RULES:
-- Choose from PYTHON CANDIDATE EXECUTION PLANS when possible.
-- Modified levels must stay anchored to a swing, OB, FVG, session level, VWAP, premium/discount boundary, or liquidity pool.
+- Choose from PYTHON CANDIDATE LIMIT-ENTRY PLANS when one is well-supported.
+- Any modified level must stay anchored to a swing, OB, FVG, session level, VWAP, premium/discount boundary, or liquidity pool — never a round-number guess and never the live price.
 - Use ENTRY price for SL/TP math, not live price.
-- MARKET: entry ≈ live price. LIMIT: BUY LIMIT below / SELL LIMIT above. STOP: BUY STOP above / SELL STOP below.
+- BUY LIMIT: entry below live price, inside the band. SELL LIMIT: entry above live price, inside the band.
 - SL beyond stop_anchor. TP respects tp_anchor.
 
 OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
@@ -2604,10 +2831,11 @@ OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
 "take_profit": [0.00, 0.00],
 "exhaustion_target": 0.00,
 "rr_ratio": 0.00,
-"order_type": "MARKET|LIMIT|STOP",
+"order_type": "LIMIT",
 "entry_anchor": "demand zone / swing low / FVG / VWAP / session low",
 "stop_anchor": "swing low / OB low / FVG bottom / invalidation level",
 "tp_anchor": "exhaustion range extreme / swing high / supply zone / FVG top / session high",
+"next_level_watch": "Next key structural level beyond TP and why price may approach it next",
 "order_expiry": "until next H1 close / until structure invalidates / GTC",
 "order_description": "Execution plan using SAME numbers as entry/stop_loss/take_profit.",
 "confluence_breakdown": "Weighting behind score: DXY, RSI, VWAP, RVOL, structure, premium/discount, market phase.",
@@ -2641,7 +2869,6 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         current_price = live_snapshot.get('price') or float(m10['Close'].iloc[-1])
         swings = find_swings(m10)
         pair_config = get_pair_config(symbol)
-        max_entry_distance = f"{pair_config.get('max_entry_points', 10)} points (HARD LIMIT for {symbol})"
         
         dxy_data = all_data.get('DXY', {}).get('H1', pd.DataFrame())
         dxy_summary = "DXY Data Unavailable"
@@ -2709,12 +2936,20 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         h4_summary = f"Latest H4 close: {h4['Close'].iloc[-1]:.2f}" if not h4.empty else "H4 data unavailable"
         htf_summary = f"H1: {h1_summary} | H4: {h4_summary}"
         
-        prompt_data = f"Symbol: {symbol} | Live Price: {current_price} | Live Price Source: {live_snapshot.get('source')} | Quote Time: {live_snapshot.get('quote_time', 'N/A')} | Swing Highs: {swings['recent_swing_highs']} | Swing Lows: {swings['recent_swing_lows']} | Market Phase: {phase_context['phase']} | Phase Reason: {phase_context['reason']} | Setup Type: {setup_context['setup_type']} | Entry Timing: {setup_context['entry_timing']} | Entry Quality: {phase_context['entry_quality']} | Entry Rule: use a price-near entry and do not chase a distant level."
+        prompt_data = f"Symbol: {symbol} | Live Price: {current_price} | Live Price Source: {live_snapshot.get('source')} | Quote Time: {live_snapshot.get('quote_time', 'N/A')} | Swing Highs: {swings['recent_swing_highs']} | Swing Lows: {swings['recent_swing_lows']} | Market Phase: {phase_context['phase']} | Phase Reason: {phase_context['reason']} | Setup Type: {setup_context['setup_type']} | Entry Timing: {setup_context['entry_timing']} | Entry Quality: {phase_context['entry_quality']} | Entry Rule: propose a resting LIMIT order at a genuine pullback level inside the entry-gap band; never at or near the live price."
         prompt_micro = f"VWAP: {micro.get('vwap', 'N/A')} | Price vs VWAP: {micro.get('price_vs_vwap', 'N/A')} | RVOL: {micro.get('rvol', 'N/A')} ({micro.get('volume_anomaly', 'N/A')})"
         structural_score_context = f"Python structural score: {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
         historical_context = build_historical_context(m10)
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
-        candidate_levels = build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, setup_context.get('atr'), pair_config)
+        atr_for_entry = setup_context.get('atr')
+        min_gap, max_gap = get_entry_gap_bounds(current_price, atr_for_entry, pair_config)
+        max_entry_distance = (
+            f"Entry must be between {min_gap:.5f} and {max_gap:.5f} price-units away from the live quote "
+            f"({symbol}) — below live price for BUY LIMIT, above it for SELL LIMIT. Closer than "
+            f"{min_gap:.5f} is a disguised market order and will be rejected and rebuilt; farther than "
+            f"{max_gap:.5f} is unrealistic and will be rejected and rebuilt."
+        )
+        candidate_levels = build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr_for_entry, pair_config, vwap=micro.get('vwap'))
         
         all_format_kwargs = {
             'data_summary': prompt_data, 'microstructure_data': prompt_micro, 'structure_context': structure_context,
@@ -2735,12 +2970,14 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         user_content = [{"type": "text", "text": prompt_text}]
         estimated_tokens = estimate_analysis_tokens(prompt_text, [])
         
-        # 🚀 CALL AI FIRST
+        # 🚀 CALL AI FIRST — max_tokens intentionally omitted so call_groq applies each
+        # model's own tuned max_completion_tokens/reasoning_effort instead of one shared cap.
         analysis = call_groq(
             prompt_text, [],
-            max_tokens=GROQ_MAX_OUTPUT_TOKENS, estimated_tokens=estimated_tokens,
+            estimated_tokens=estimated_tokens,
             image_b64=image_b64, image_mime_type=image_mime_type
         )
+        st.session_state.last_model_attempts[symbol] = analysis.get('model_attempts', [])
         
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
@@ -2827,6 +3064,24 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         if analysis.get('signal') in ('BUY', 'SELL') and analysis.get('take_profit'):
             final_note = f"Final levels: Entry {analysis['entry']} | SL {analysis['stop_loss']} | TP {analysis['take_profit'][0]}."
             analysis['order_description'] = f"{final_note} {analysis.get('order_description') or ''}".strip()
+            if not analysis.get('next_level_watch'):
+                # The AI didn't populate this (or Python built the plan) — derive the next
+                # structural level beyond TP so the user always sees where price is likely
+                # headed next if the trade keeps running, per "next level approaching".
+                try:
+                    tp1 = analysis['take_profit'][0]
+                    next_level = build_exhaustion_target(
+                        analysis['signal'], tp1, m10, swings, order_blocks, fvgs,
+                        setup_context.get('atr'), pair_config
+                    )
+                    if next_level and abs(next_level - tp1) > (setup_context.get('atr') or 0) * 0.1:
+                        analysis['next_level_watch'] = (
+                            f"Beyond TP1, the next level in play is ~{round_price(next_level, pair_config)} "
+                            f"— watch for price to approach it if {symbol} continues {analysis['signal'].lower()}ing "
+                            f"through the current {analysis.get('market_state', 'phase')}."
+                        )
+                except Exception:
+                    pass
             
         analysis['validation_detail'] = build_validation_detail(analysis, swings, current_price, symbol, pair_config=pair_config, structural_context=structural_context)
         analysis['display_reasoning'] = build_display_reason(analysis, symbol, current_price=current_price, phase_context=phase_context, structural_context=structural_context, dxy_context=dxy_context)
@@ -2881,7 +3136,15 @@ with tab1:
                         rejection = result.get('rejection_reason', '')
                         
                         status_color = "green" if api_status in ['SUCCESS', 'SUCCESS_EXTRACTED', 'FALLBACK'] else "red"
-                        st.markdown(f"**🤖 AI Model:** `{model_used}` | **🔋 Tokens Used:** `{total_tokens}` (Prompt: {prompt_tokens}, Completion: {completion_tokens}) | **📡 Status:** <span style='color:{status_color}; font-weight:bold;'>{api_status}</span>", unsafe_allow_html=True)
+                        primary_ok = model_used == GROQ_MODELS[0] and api_status in ['SUCCESS', 'SUCCESS_EXTRACTED']
+                        model_badge = "🥇 primary" if primary_ok else ("⬇️ fallback model" if model_used in GROQ_MODELS else "")
+                        st.markdown(f"**🤖 AI Model:** `{model_used}` {model_badge} | **🔋 Tokens Used:** `{total_tokens}` (Prompt: {prompt_tokens}, Completion: {completion_tokens}) | **📡 Status:** <span style='color:{status_color}; font-weight:bold;'>{api_status}</span>", unsafe_allow_html=True)
+
+                        attempts = st.session_state.last_model_attempts.get(symbol) or result.get('model_attempts')
+                        if attempts and (not primary_ok or any(a.get('status') not in ('SUCCESS',) for a in attempts)):
+                            with st.expander(f"🔎 Why {GROQ_MODELS[0]} wasn't used" if not primary_ok else "🔎 Model attempt log"):
+                                for a in attempts:
+                                    st.caption(f"`{a.get('model')}` → {a.get('status')}")
 
                         if api_status == 'FALLBACK' and result.get('groq_failure'):
                             st.warning(
@@ -2920,11 +3183,12 @@ with tab1:
                             st.write(f"**DXY Correlation:** {result.get('dxy_correlation', 'N/A')}")
                             st.write(f"**Microstructure:** {result.get('microstructure_read', 'N/A')}")
                             st.write(f"**Visual Levels (Chart):** {result.get('visual_levels', 'N/A')}")
-                            st.info(f"**Entry:** {result.get('entry')} | **SL:** {result.get('stop_loss')} | **TP:** {result.get('take_profit')}")
-                            if result.get('order_type'):
-                                st.write(f"**Order Type:** {result.get('order_type')}")
+                            st.info(f"**Entry (LIMIT):** {result.get('entry')} | **SL:** {result.get('stop_loss')} | **TP:** {result.get('take_profit')} | **R:R:** {result.get('rr_ratio', 'N/A')}")
+                            st.write(f"**Order Type:** {result.get('order_type', 'LIMIT')}")
                             if result.get('order_description'):
                                 st.write(f"**Execution Plan:** {result.get('order_description')}")
+                            if result.get('next_level_watch'):
+                                st.write(f"**🔭 Next Level Watch:** {result.get('next_level_watch')}")
                             st.write(f"**AI Reasoning:** {result.get('reasoning')}")
                             validation_notes = result.get('python_validation_notes') or []
                             if validation_notes:
@@ -3013,8 +3277,43 @@ with tab3:
 with tab4:
     st.header("⚙️ System Settings")
     st.info("Ensure `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are set in your Streamlit Secrets.")
-    st.markdown("- **AI Model:** Llama 4 Scout / Llama 3.3 70B via Groq (Multimodal)")
+    st.markdown(f"- **AI Model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
+    st.markdown("- **Execution:** All signals are resting LIMIT orders at a structural pullback level — no market or stop entries, no WAIT signals")
     st.markdown("- **Execution:** Manual trigger only (No auto-loop)")
     st.markdown("- **Features:** SMC, BOS/CHOCH, FVG, Order Blocks, Liquidity Sweeps, DXY Correlation, Regime Filter (ADX), Multi-Strategy Confluence")
     st.markdown(f"- **Minimum Confluence Score:** {MINIMUM_CONFLUENCE_SCORE}/100")
     st.markdown("- **Chart Screenshot:** Upload market charts for AI to analyze alongside data")
+
+    st.markdown("---")
+    st.subheader("🔧 Groq Model Diagnostics")
+    st.caption(
+        "GROQ_MODELS is always tried in the order below — this app no longer lets Groq's "
+        "model-discovery endpoint silently reorder or drop the primary model. Use this panel "
+        "if the primary model still isn't being used, to see what your account/key actually "
+        "reports as available."
+    )
+    for m in GROQ_MODELS:
+        cfg = GROQ_MODEL_CONFIG.get(m, GROQ_DEFAULT_MODEL_CONFIG)
+        st.write(f"**{m}** — max_completion_tokens={cfg['max_completion_tokens']}, reasoning_effort={cfg.get('reasoning_effort')}")
+    if st.button("Check Groq /models endpoint now"):
+        api_key = get_secret("GROQ_API_KEY", "").strip()
+        if not api_key:
+            st.error("GROQ_API_KEY is not set.")
+        else:
+            discovery = get_groq_models(api_key)
+            if discovery.get('ok'):
+                available = discovery.get('available', [])
+                for m in GROQ_MODELS:
+                    if m in available:
+                        st.success(f"✅ {m} — reported available by Groq")
+                    else:
+                        st.warning(f"⚠️ {m} — NOT reported by Groq's /models endpoint right now (the app will still try it; a live HTTP error at call time is the authoritative signal, not this list)")
+            else:
+                st.error(f"Could not reach Groq /models endpoint: {discovery.get('reason')}")
+    last_attempts = st.session_state.get('last_model_attempts') or {}
+    if last_attempts:
+        st.markdown("**Last analysis run — per-symbol model attempts:**")
+        for sym, attempts in last_attempts.items():
+            if not attempts:
+                continue
+            st.write(f"`{sym}`: " + " → ".join(f"{a.get('model')}:{a.get('status')}" for a in attempts))
