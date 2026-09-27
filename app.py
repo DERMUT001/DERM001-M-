@@ -695,7 +695,7 @@ def build_volatility_context(m10):
 def build_historical_context(m10):
     if m10 is None or m10.empty:
         return 'Historical context unavailable.'
-    closes = [round(float(v), 4) for v in m10['Close'].tail(20).tolist()]
+    closes = [round(float(v), 4) for v in m10['Close'].tail(10).tolist()]
     if len(closes) < 2:
         return 'Historical context unavailable.'
     latest = float(m10['Close'].iloc[-1])
@@ -704,7 +704,7 @@ def build_historical_context(m10):
     high = float(m10['High'].tail(20).max())
     low = float(m10['Low'].tail(20).min())
     range_pct = round(((high - low) / latest) * 100, 2) if latest else 0.0
-    return f"Last 20 closes: {closes}; latest 1-bar change: {change_pct}%; recent 20-bar range: {range_pct}%."
+    return f"Last 10 M10 closes: {closes}; latest 1-bar change: {change_pct}%; recent 20-bar range: {range_pct}%."
 
 def compute_rsi_last(series, period=14):
     rsi = calculate_rsi(series, period)
@@ -772,6 +772,94 @@ def build_market_structure_summary(df, current_price=None, swings=None, order_bl
         f"current price={current_price:.2f}. The AI must identify whether price is approaching a demand/supply or support/resistance zone, "
         f"and whether the next move is a continuation or a reversal into the next clear invalidation zone."
     )
+
+def compute_timeframe_structure(df, label):
+    """Bundle every structural read for one timeframe into a single dict. Used to build the
+    HTF (direction) and LTF (entry-timing) prompt blocks from a consistent, reusable source."""
+    if df is None or df.empty or len(df) < 5:
+        return None
+    try:
+        micro = calculate_microstructure(df)
+        bos, choch = detect_bos_choch(df)
+        return {
+            'label': label,
+            'micro': micro,
+            'bos': bos,
+            'choch': choch,
+            'order_blocks': detect_order_blocks(df),
+            'fvgs': detect_fvg(df),
+            'sweeps': detect_liquidity_sweeps(df),
+            'swings': find_swings(df),
+            'divergence': detect_rsi_divergence(df),
+            'rsi': compute_rsi_last(pd.to_numeric(df['Close'], errors='coerce')),
+            'atr': calculate_atr(df),
+            'close': float(df['Close'].iloc[-1]),
+            'candles': analyze_candle_structure(df),
+        }
+    except Exception:
+        return None
+
+def _fmt_zone_list(items, formatter, limit=2):
+    picked = (items or [])[-limit:]
+    return '; '.join(formatter(x) for x in picked) if picked else 'none'
+
+def build_htf_structure_block(h4_struct, h1_struct, h1_df, current_price, pair_config):
+    """THE authoritative directional-bias block. Built entirely from H4 (macro) and H1
+    (primary) structure — BOS/CHOCH, order blocks, FVGs, swings, RSI divergence, premium/
+    discount of the dealing range — so bias/market_state is decided on timeframes that
+    actually hold up, not on 10-minute noise."""
+    lines = []
+    for label, s in (('4H (macro)', h4_struct), ('1H (primary)', h1_struct)):
+        if not s:
+            lines.append(f"{label}: data unavailable.")
+            continue
+        m = s['micro']
+        markers = ', '.join(x for x in [s['bos'], s['choch']] if x) or 'no fresh BOS/CHOCH'
+        obs = _fmt_zone_list(s['order_blocks'], lambda ob: f"{ob['type']}@{ob['price']:.2f}({ob['strength']})")
+        fv = _fmt_zone_list(s['fvgs'], lambda f: f"{f['type']} {f['bottom']:.2f}-{f['top']:.2f}")
+        sw = _fmt_zone_list(s['sweeps'], lambda sp: f"{sp['type']}@{sp['price']:.2f}", limit=1)
+        div = f"{s['divergence']['type']} ({s['divergence']['reason']})" if s['divergence'] else 'none'
+        lines.append(
+            f"{label}: trend={m.get('momentum')} (price {m.get('price_vs_vwap')} VWAP, RVOL {m.get('rvol')}), "
+            f"structure={markers}, order blocks=[{obs}], FVGs=[{fv}], sweep=[{sw}], RSI {s['rsi']} div={div}, "
+            f"swing highs={s['swings']['recent_swing_highs']}, swing lows={s['swings']['recent_swing_lows']}."
+        )
+    pd_text = build_premium_discount_context(h1_df, current_price) if h1_df is not None and not h1_df.empty else 'Range position unavailable.'
+    lines.append(f"H1 dealing-range position: {pd_text}")
+    return ' '.join(lines)
+
+def build_ltf_entry_block(m30_struct, m15_struct, m10_struct, current_price, pair_config):
+    """LTF entry-timing block ONLY — never used to determine direction. M15 is the primary
+    entry timeframe (pullback structure the limit order anchors to); M30 cross-checks that the
+    M15 pullback zone isn't pure noise; M10 gives the finest-grained VWAP/RVOL/candle read for
+    whether a pullback is actually happening right now."""
+    lines = []
+    if m15_struct:
+        s = m15_struct
+        obs = _fmt_zone_list(s['order_blocks'], lambda ob: f"{ob['type']}@{ob['price']:.2f}({ob['strength']})")
+        fv = _fmt_zone_list(s['fvgs'], lambda f: f"{f['type']} {f['bottom']:.2f}-{f['top']:.2f}")
+        div = f"{s['divergence']['type']}" if s['divergence'] else 'none'
+        atr_txt = f"{s['atr']:.5f}" if s.get('atr') else 'n/a'
+        lines.append(
+            f"15M (primary entry TF): order blocks=[{obs}], FVGs=[{fv}], swing highs={s['swings']['recent_swing_highs']}, "
+            f"swing lows={s['swings']['recent_swing_lows']}, RSI {s['rsi']} div={div}, ATR {atr_txt}."
+        )
+    else:
+        lines.append("15M: data unavailable.")
+    if m30_struct:
+        s = m30_struct
+        markers = ', '.join(x for x in [s['bos'], s['choch']] if x) or 'balanced'
+        lines.append(f"30M (confirmation): structure={markers}, momentum={s['micro'].get('momentum')}, price vs VWAP={s['micro'].get('price_vs_vwap')}.")
+    else:
+        lines.append("30M: data unavailable.")
+    if m10_struct:
+        s = m10_struct
+        recent_candle = s['candles'][-1] if s.get('candles') else None
+        candle_txt = f", last candle {recent_candle['pattern']} ({recent_candle['candle_type']})" if recent_candle else ""
+        lines.append(f"10M (timing): momentum={s['micro'].get('momentum')}, price vs VWAP={s['micro'].get('price_vs_vwap')}, RVOL={s['micro'].get('rvol')}{candle_txt}.")
+    else:
+        lines.append("10M: data unavailable.")
+    return ' '.join(lines)
 
 def build_multitimeframe_context(all_data, symbol):
     if not all_data or not symbol:
@@ -1420,35 +1508,37 @@ def _desk_position_lock(symbol, proposed, current_price):
     except Exception:
         return None
 
-def build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=None):
-    """Build genuine LIMIT-order candidate plans the AI can choose from or refine. These are
-    pullback entries anchored to real structure (order block / FVG / swing / VWAP) inside the
-    institutional limit-order band — never a plan sitting at the live price, which previously
-    biased the AI toward proposing market-style entries."""
+def build_candidate_levels(symbol, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
+                            htf_swings, htf_order_blocks, htf_fvgs, atr_htf, pair_config,
+                            vwap=None, htf_df=None):
+    """Build genuine LIMIT-order candidate plans the AI can choose from or refine. Entry price
+    comes from LTF (M15/M30) pullback structure — an order block, FVG, swing or VWAP a
+    realistic distance from live price. SL/TP come from HTF (H1/H4) structure and HTF ATR, so
+    risk is sized to the timeframe the trade thesis is actually based on, not to LTF noise."""
     plans = []
     try:
         current_price = float(current_price)
     except Exception:
         return plans
     for signal in ('BUY', 'SELL'):
-        candidate_entry = compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=vwap)
+        candidate_entry = compute_default_limit_entry(signal, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf, pair_config, vwap=vwap)
         if not candidate_entry:
             continue
-        market_plan = build_structural_plan_v2(
+        plan = build_structural_plan_v2(
             signal=signal,
             entry=candidate_entry,
             current_price=current_price,
-            swings=swings,
-            order_blocks=order_blocks,
-            fvgs=fvgs,
-            atr=atr,
+            swings=htf_swings,
+            order_blocks=htf_order_blocks,
+            fvgs=htf_fvgs,
+            atr=atr_htf,
             pair_config=pair_config,
-            market_df=None
+            market_df=htf_df
         )
-        if market_plan:
-            market_plan['plan'] = 'LIMIT'
-            market_plan['signal'] = signal
-            plans.append(market_plan)
+        if plan:
+            plan['plan'] = 'LIMIT'
+            plan['signal'] = signal
+            plans.append(plan)
     return plans
 
 def build_exhaustion_target(signal, entry, df, swings, order_blocks, fvgs, atr, pair_config):
@@ -1760,7 +1850,7 @@ def compute_default_limit_entry(signal, current_price, swings, order_blocks, fvg
         default_gap = min(max(atr * float(pair_config.get('default_pullback_atr', 0.55)), min_gap), max_gap)
         return current_price + default_gap
 
-def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair_config):
+def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair_config, atr_htf=None):
     try:
         entry = float(entry)
         sl = float(sl)
@@ -1770,6 +1860,8 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         return False, "Missing or non-numeric entry/SL/TP."
     if entry <= 0 or sl <= 0 or tp <= 0 or current_price <= 0:
         return False, "Entry, SL, TP, and current price must be positive."
+    # Entry-gap band uses the LTF (entry-timeframe) ATR: how far price realistically pulls
+    # back on the timeframe you're timing the entry from.
     min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr, pair_config)
     gap = abs(entry - current_price)
     if gap > max_entry_gap:
@@ -1783,13 +1875,17 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         return False, "BUY LIMIT must be below current price."
     if signal == 'SELL' and entry <= current_price:
         return False, "SELL LIMIT must be above current price."
+    # Stop/target distance uses the HTF ATR (falls back to the entry-timeframe ATR if no HTF
+    # reading is available) since risk should be sized to the timeframe the trade thesis
+    # actually plays out on, not to 10-minute noise.
+    sizing_atr = atr_htf if atr_htf else atr
     min_stop_distance = max(
         abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        float(atr or 0.0) * float(pair_config.get('min_stop_atr', 1.0))
+        float(sizing_atr or 0.0) * float(pair_config.get('min_stop_atr', 1.0))
     )
     max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
-    if atr:
-        max_stop_distance = min(max_stop_price, float(atr) * float(pair_config.get('max_stop_atr', 3.0)))
+    if sizing_atr:
+        max_stop_distance = min(max_stop_price, float(sizing_atr) * float(pair_config.get('max_stop_atr', 3.0)))
     else:
         max_stop_distance = max_stop_price
     if signal == 'BUY':
@@ -1823,19 +1919,20 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         return False, f"RR too high / TP too far from entry. RR={rr:.2f}, max={max_rr:.2f}."
     return True, "Valid"
 
-def build_atr_fallback_plan(signal, entry, pair_config, atr):
+def build_atr_fallback_plan(signal, entry, pair_config, atr, atr_htf=None):
     """Deterministic, always-valid SL/TP builder used only when no structural anchor (order
     block, FVG, swing) is usable. Sizes risk purely from ATR/min-distance rules so a signal
-    is always produced — this desk never returns WAIT for lack of a plan."""
+    is always produced — this desk never returns WAIT for lack of a plan. Uses the HTF ATR for
+    sizing when available (risk should match the timeframe the trade thesis plays out on)."""
     entry = float(entry)
-    atr = float(atr) if atr else abs(entry) * float(pair_config.get('min_dist_pct', 0.0015))
+    sizing_atr = float(atr_htf) if atr_htf else (float(atr) if atr else abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)))
     min_stop_distance = max(
         abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        atr * float(pair_config.get('min_stop_atr', 1.0))
+        sizing_atr * float(pair_config.get('min_stop_atr', 1.0))
     )
     max_stop_distance = min(
         abs(entry) * float(pair_config.get('max_risk_pct', 0.008)),
-        atr * float(pair_config.get('max_stop_atr', 3.0))
+        sizing_atr * float(pair_config.get('max_stop_atr', 3.0))
     )
     if max_stop_distance < min_stop_distance:
         max_stop_distance = min_stop_distance * 1.5
@@ -1861,7 +1958,15 @@ def build_atr_fallback_plan(signal, entry, pair_config, atr):
         'levels_source': 'PYTHON_ATR_FALLBACK',
     }
 
-def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, fvgs, atr, pair_config, market_df=None):
+def finalize_trade_plan(analysis, symbol, current_price,
+                         ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
+                         htf_swings, htf_order_blocks, htf_fvgs, atr_htf,
+                         pair_config, htf_df=None, ltf_df=None):
+    """Builds/validates the final entry+SL+TP. Entry (and the min/max limit-order gap it must
+    sit in) is anchored to LTF structure/ATR (M15/M30) — the timeframe a pullback entry is
+    actually timed from. SL/TP/exhaustion-target sizing is anchored to HTF structure/ATR (H1/
+    H4) — the timeframe the trade thesis is actually based on. atr_htf falls back to atr_ltf if
+    HTF data is unavailable so the desk can still always produce a valid plan."""
     if not isinstance(analysis, dict):
         return analysis
     signal = analysis.get('signal')
@@ -1871,12 +1976,13 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
         current_price = float(current_price)
     except Exception:
         return analysis
+    atr_htf = atr_htf or atr_ltf
     entry = analysis.get('entry')
     try:
         entry = float(entry)
     except Exception:
         entry = None
-    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr, pair_config)
+    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr_ltf, pair_config)
     gap = abs(entry - current_price) if entry else None
     needs_recompute = entry is None or entry <= 0 or gap is None or gap > max_entry_gap or gap < min_entry_gap
     # Directional sanity: a BUY entry must sit below live price and a SELL entry above it,
@@ -1889,38 +1995,38 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
     if needs_recompute:
         vwap = None
         try:
-            if market_df is not None and not market_df.empty:
-                micro = calculate_microstructure(market_df)
+            if ltf_df is not None and not ltf_df.empty:
+                micro = calculate_microstructure(ltf_df)
                 vwap = micro.get('vwap')
         except Exception:
             vwap = None
-        computed_entry = compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=vwap)
+        computed_entry = compute_default_limit_entry(signal, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf, pair_config, vwap=vwap)
         entry = computed_entry if computed_entry else (
-            current_price - max(min_entry_gap, (atr or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
+            current_price - max(min_entry_gap, (atr_ltf or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
             if signal == 'BUY' else
-            current_price + max(min_entry_gap, (atr or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
+            current_price + max(min_entry_gap, (atr_ltf or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
         )
         analysis['order_type'] = 'LIMIT'
         analysis['levels_source'] = 'PYTHON'
-        add_python_validation_note(analysis, "Entry was re-anchored to the nearest qualifying structural pullback level (order block / FVG / swing / VWAP) because the proposed entry was missing, too close to a market order, or outside the reasonable limit-order band.")
+        add_python_validation_note(analysis, "Entry was re-anchored to the nearest qualifying M15/M30 structural pullback level (order block / FVG / swing / VWAP) because the proposed entry was missing, too close to a market order, or outside the reasonable limit-order band.")
     analysis['order_type'] = 'LIMIT'
     canonical_plan = build_structural_plan_v2(
         signal=signal,
         entry=entry,
         current_price=current_price,
-        swings=swings,
-        order_blocks=order_blocks,
-        fvgs=fvgs,
-        atr=atr,
+        swings=htf_swings,
+        order_blocks=htf_order_blocks,
+        fvgs=htf_fvgs,
+        atr=atr_htf,
         pair_config=pair_config,
-        market_df=market_df
+        market_df=htf_df
     )
     if canonical_plan:
         analysis['stop_loss'] = canonical_plan['stop_loss']
         analysis['take_profit'] = canonical_plan['take_profit']
         analysis['exhaustion_target'] = canonical_plan['exhaustion_target']
         analysis['levels_source'] = 'PYTHON_EXHAUSTION_TARGET'
-        add_python_validation_note(analysis, "TP is the nearest executable exhaustion/liquidity target; SL is beyond the structural invalidation with ATR buffering.")
+        add_python_validation_note(analysis, "TP is the nearest executable H1/H4 exhaustion/liquidity target; SL is beyond H1/H4 structural invalidation with HTF-ATR buffering.")
     analysis['entry'] = round_price(entry, pair_config)
     sl = analysis.get('stop_loss')
     tp_list = analysis.get('take_profit', [])
@@ -1932,28 +2038,29 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
         sl=sl,
         tp=tp,
         current_price=current_price,
-        atr=atr,
-        pair_config=pair_config
+        atr=atr_ltf,
+        pair_config=pair_config,
+        atr_htf=atr_htf
     )
     if not ok:
         plan = build_structural_plan_v2(
             signal=signal,
             entry=entry,
             current_price=current_price,
-            swings=swings,
-            order_blocks=order_blocks,
-            fvgs=fvgs,
-            atr=atr,
+            swings=htf_swings,
+            order_blocks=htf_order_blocks,
+            fvgs=htf_fvgs,
+            atr=atr_htf,
             pair_config=pair_config,
-            market_df=market_df
+            market_df=htf_df
         )
         if not plan:
             # Last-resort deterministic ATR-based plan. No WAIT signals are produced by this
             # desk — if no structural anchor is usable, a clean risk-defined limit trade is
-            # built directly from volatility so the analysis always resolves to an executable
-            # BUY/SELL limit.
-            plan = build_atr_fallback_plan(signal, entry, pair_config, atr)
-            add_python_validation_note(analysis, f"No structural SL/TP anchor was usable ({reason}); levels were built directly from ATR risk sizing instead.")
+            # built directly from HTF volatility so the analysis always resolves to an
+            # executable BUY/SELL limit.
+            plan = build_atr_fallback_plan(signal, entry, pair_config, atr_ltf, atr_htf=atr_htf)
+            add_python_validation_note(analysis, f"No structural SL/TP anchor was usable ({reason}); levels were built directly from HTF ATR risk sizing instead.")
         analysis.update(plan)
     analysis['entry'] = round_price(analysis.get('entry'), pair_config)
     analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
@@ -1973,18 +2080,19 @@ def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, f
         sl=final_sl,
         tp=final_tp,
         current_price=current_price,
-        atr=atr,
-        pair_config=pair_config
+        atr=atr_ltf,
+        pair_config=pair_config,
+        atr_htf=atr_htf
     )
     if not ok_final:
-        # Deterministic safety net: rebuild from ATR risk sizing directly off the (already
+        # Deterministic safety net: rebuild from HTF ATR risk sizing directly off the (already
         # band-validated) entry rather than surrendering to a WAIT signal.
-        plan = build_atr_fallback_plan(analysis.get('signal'), final_entry, pair_config, atr)
+        plan = build_atr_fallback_plan(analysis.get('signal'), final_entry, pair_config, atr_ltf, atr_htf=atr_htf)
         analysis.update(plan)
         analysis['entry'] = round_price(analysis.get('entry'), pair_config)
         analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
         analysis['take_profit'] = [round_price(x, pair_config) for x in analysis.get('take_profit', []) if x is not None]
-        add_python_validation_note(analysis, f"Final level validation rebuilt the plan from ATR risk sizing (previous levels failed: {reason_final}).")
+        add_python_validation_note(analysis, f"Final level validation rebuilt the plan from HTF ATR risk sizing (previous levels failed: {reason_final}).")
     entry_f = float(analysis['entry'])
     sl_f = float(analysis['stop_loss'])
     tp_f = float(analysis['take_profit'][0])
@@ -2756,64 +2864,48 @@ def build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context
     }
 
 def build_market_analysis_prompt():
-    return """You are an elite institutional trading desk AI. You have FULL access to all data below including an attached chart screenshot. Use ALL concepts — miss nothing.
+    return """You are an elite institutional trading desk AI. Use every data block below plus the attached chart screenshot if present. This desk runs strict top-down analysis: HIGHER TIMEFRAMES (H4/H1) decide direction; LOWER TIMEFRAMES (M15/M30/M10) ONLY time the exact limit-entry price. Never let LTF noise change your direction call.
 
-DATA PROVIDED:
+DATA SUMMARY:
 {data_summary}
-MICROSTRUCTURE (M10):
+M10 MICROSTRUCTURE (fine-grained timing only):
 {microstructure_data}
-STRUCTURE CONTEXT:
-{structure_context}
-MARKET STRUCTURE ZONES:
-{market_structure_summary}
-MULTI-TIMEFRAME CONTEXT (10M/15M/30M/1H/4H):
-{multitimeframe_context}
-RSI VALUES (MULTI-TIMEFRAME):
+== HTF STRUCTURE (H4 macro + H1 primary) — THIS DECIDES BIAS / MARKET_STATE / SIGNAL ==
+{htf_structure}
+PYTHON DIRECTIONAL LEDGER (built on H1):
+{directional_ledger}
+STRUCTURAL SCORE (PYTHON, H1-based):
+{structural_score_context}
+FIRM DESK BIAS (HTF-first with hysteresis):
+{firm_bias}
+RSI VALUES (all timeframes):
 {rsi_values}
-RSI / DIVERGENCE CONTEXT:
+RSI DIVERGENCE (H1 = bias signal, M15 = entry-timing signal):
 {rsi_context}
-PREMIUM/DISCOUNT POSITION:
-{premium_discount}
-VOLATILITY (ATR):
+VOLATILITY — TWO SEPARATE ATRs, DO NOT MIX THEM:
 {volatility_context}
-HTF CONTEXT (H1/H4):
+HTF CLOSES (H1/H4):
 {htf_context}
 DXY (US Dollar Index) TREND:
 {dxy_data}
-HISTORICAL CONTEXT:
+== LTF ENTRY TIMING (M15 primary + M30 confirm + M10 timing) — USE ONLY TO PICK THE EXACT LIMIT PRICE, NEVER TO CHANGE DIRECTION ==
+{ltf_structure}
+RECENT M10 PRICE ACTION:
 {historical_context}
-STRUCTURAL SCORE (PYTHON):
-{structural_score_context}
-PYTHON DIRECTIONAL LEDGER:
-{directional_ledger}
-FIRM DESK BIAS (HTF-FIRST WITH HYSTERESIS):
-{firm_bias}
 ENTRY GAP RULE (institutional limit-order band, hard-enforced in Python after you answer):
 {max_entry_distance}
-PYTHON CANDIDATE LIMIT-ENTRY PLANS (pullback levels you may use as-is or refine):
+PYTHON CANDIDATE LIMIT-ENTRY PLANS (LTF entry + HTF-sized SL/TP — use as-is or refine):
 {candidate_levels}
 
 DECISION RULES:
-1. Use every supplied input: live quote, all timeframes, RSI/divergence, VWAP, RVOL, DXY, SMC structure, zones, volatility, candles and screenshot.
-2. Set market_state to continuation, reversal, exhaustion, trend or coiling. Choose BUY or SELL only; never output WAIT — this desk always resolves to an executable trade.
-3. Decide direction in this order: H4/H1 trend, sweep plus divergence, premium/discount, then VWAP/momentum. Explain any override.
-4. This desk trades ONLY resting limit orders. The live quote is context for where price is now, never the entry. You must select or build a pullback level the market has to retrace to before the order fills — an order block, FVG, VWAP, premium/discount boundary, swing retracement or session level — and it must sit inside the ENTRY GAP RULE band above (far enough from live price to be a genuine limit, close enough to realistically get tagged). Prefer the supplied PYTHON CANDIDATE LIMIT-ENTRY PLANS when one fits; refine the level only when structure clearly supports a better one, still inside the band.
-5. Prefer BUY in discount and SELL in premium, but follow a clearly confirmed sweep/reversal when stronger.
-6. Describe bullish and bearish evidence separately; signal must match the stronger side.
-7. Use DXY as a macro filter for XAUUSD, EURUSD and BTCUSD. Contradiction reduces confidence but does not automatically reverse direction.
-8. order_type is always "LIMIT": BUY LIMIT must sit below the live quote, SELL LIMIT must sit above it. Never propose an entry at or within a hair of the live price — that is a market order in disguise and will be rejected and rebuilt by the execution layer.
-9. Set an exhaustion_target at the most realistic opposing range/liquidity extreme that the move can reach before stalling, measured FROM THE LIMIT ENTRY, not from the live price. Use it as TP. Put SL beyond clear invalidation with ATR room; never guarantee a target, and reject levels that violate minimum 1.5 R:R or maximum risk.
-10. Keep all numbers identical across entry, stop_loss, take_profit and order_description — and make sure the written reasoning explains the SAME entry/SL/TP numbers you output, not a different price you considered along the way.
-11. If the screenshot is usable, identify visible support, resistance, liquidity, trendlines and patterns in visual_levels; otherwise say unavailable.
-12. Also populate "next_level_watch": the next key structural level beyond your take_profit in the trade direction (the level price is likely to approach next if the setup keeps running), with a one-line reason it matters.
-13. Be concise but specific: reasoning must mention HTF bias, key evidence, macro, momentum/volume, entry anchor, invalidation, target, risk, and why the entry is a genuine pullback rather than a chase. Complete valid JSON before adding detail.
-
-ENTRY EXECUTION RULES:
-- Choose from PYTHON CANDIDATE LIMIT-ENTRY PLANS when one is well-supported.
-- Any modified level must stay anchored to a swing, OB, FVG, session level, VWAP, premium/discount boundary, or liquidity pool — never a round-number guess and never the live price.
-- Use ENTRY price for SL/TP math, not live price.
-- BUY LIMIT: entry below live price, inside the band. SELL LIMIT: entry above live price, inside the band.
-- SL beyond stop_anchor. TP respects tp_anchor.
+1. STEP ONE — DIRECTION (HTF ONLY): Read == HTF STRUCTURE ==, the H1-based PYTHON DIRECTIONAL LEDGER, the H1-based STRUCTURAL SCORE, and FIRM DESK BIAS. Decide market_state (continuation/reversal/exhaustion/trend/coiling) and signal (BUY or SELL — never WAIT, this desk always resolves to an executable trade) from these alone. Use H4 for the macro trend, H1 for the primary trend/structure/premium-discount, H1 RSI divergence, and DXY as a macro filter for XAUUSD/EURUSD/BTCUSD. Do not let anything in the LTF ENTRY TIMING section influence this decision — explain any override of FIRM DESK BIAS explicitly.
+2. STEP TWO — ENTRY (LTF ONLY, after direction is locked): Read == LTF ENTRY TIMING == and PYTHON CANDIDATE LIMIT-ENTRY PLANS. Select or refine a genuine M15/M30 pullback level (order block, FVG, swing, VWAP) that sits inside the ENTRY GAP RULE band. The live quote is never the entry. M10 timing confirms whether that pullback is actually happening now (momentum/VWAP/RVOL/last candle) — it does not pick the level or change direction.
+3. order_type is always "LIMIT": BUY LIMIT below the live quote, SELL LIMIT above it. An entry at or within a hair of live price is a disguised market order and will be rejected and rebuilt.
+4. Set exhaustion_target at the most realistic opposing HTF range/liquidity extreme the move can reach before stalling, measured FROM THE ENTRY. Use it as TP. Put SL beyond clear HTF structural invalidation with ATR room (use the HTF ATR, not the LTF one); never guarantee a target, and reject levels that violate minimum 1.5 R:R or maximum risk.
+5. Populate "next_level_watch": the next key HTF structural level beyond take_profit in the trade direction, with a one-line reason.
+6. Keep all numbers identical across entry, stop_loss, take_profit and order_description — reasoning must explain the SAME numbers you output, not a price you considered along the way.
+7. If the screenshot is usable, identify visible support, resistance, liquidity, trendlines and patterns in visual_levels; otherwise say unavailable.
+8. Be concise but specific: reasoning must state the HTF bias and its evidence first, then the LTF entry justification separately, then invalidation, target, risk. Complete valid JSON before adding detail — do not spend tokens narrating your thought process outside the JSON fields.
 
 OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
 {{
@@ -2823,7 +2915,9 @@ OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
 "confluence_score": 0,
 "confidence": "HIGH|MEDIUM|LOW",
 "dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL",
-"microstructure_read": "Brief VWAP/RVOL status and intrabar read",
+"htf_bias_basis": "1-2 sentences: H4/H1 structure and evidence that decided the direction (HTF ONLY)",
+"ltf_entry_basis": "1-2 sentences: the M15/M30 pullback level chosen/refined and why, plus M10 timing confirmation (LTF ONLY)",
+"microstructure_read": "Brief M10 VWAP/RVOL status and intrabar read",
 "directional_evidence": {{"bullish": ["item1","item2"], "bearish": ["item1","item2"]}},
 "visual_levels": "Describe key levels seen on the chart screenshot: support, resistance, liquidity pools, trendlines",
 "entry": 0.00,
@@ -2832,14 +2926,14 @@ OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
 "exhaustion_target": 0.00,
 "rr_ratio": 0.00,
 "order_type": "LIMIT",
-"entry_anchor": "demand zone / swing low / FVG / VWAP / session low",
-"stop_anchor": "swing low / OB low / FVG bottom / invalidation level",
-"tp_anchor": "exhaustion range extreme / swing high / supply zone / FVG top / session high",
-"next_level_watch": "Next key structural level beyond TP and why price may approach it next",
+"entry_anchor": "M15/M30 demand zone / swing low / FVG / VWAP",
+"stop_anchor": "H1/H4 swing low / OB / FVG / invalidation level",
+"tp_anchor": "H1/H4 exhaustion range extreme / swing high / supply zone / FVG",
+"next_level_watch": "Next key HTF structural level beyond TP and why price may approach it next",
 "order_expiry": "until next H1 close / until structure invalidates / GTC",
 "order_description": "Execution plan using SAME numbers as entry/stop_loss/take_profit.",
-"confluence_breakdown": "Weighting behind score: DXY, RSI, VWAP, RVOL, structure, premium/discount, market phase.",
-"reasoning": "Concise pair-specific analysis covering HTF structure, strongest evidence, RSI/divergence, DXY, VWAP/RVOL, entry anchor, invalidation, exhaustion target and risk.",
+"confluence_breakdown": "Weighting behind score: HTF structure, DXY, RSI, VWAP, RVOL, premium/discount, market phase.",
+"reasoning": "Concise analysis: HTF bias + evidence, LTF entry justification, invalidation, exhaustion target, risk.",
 "rejection_reason": ""
 }}"""
 
@@ -2867,7 +2961,36 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             
         micro = calculate_microstructure(m10)
         current_price = live_snapshot.get('price') or float(m10['Close'].iloc[-1])
-        swings = find_swings(m10)
+        pair_config = get_pair_config(symbol)
+        m15_data = data.get('M15', pd.DataFrame())
+        m30_data = data.get('M30', pd.DataFrame())
+
+        # --- Timeframe roles ---------------------------------------------------------------
+        # H4 (macro) + H1 (primary) decide DIRECTION: bias, market_state, structural score,
+        # the directional evidence ledger, and SL/TP/exhaustion-target sizing.
+        # M15 (primary) + M30 (confirm) + M10 (timing) decide ONLY the exact LIMIT entry price
+        # within whatever zone the HTF bias points to, plus immediate timing/momentum confirmation.
+        h4_struct = compute_timeframe_structure(h4, 'H4')
+        h1_struct = compute_timeframe_structure(h1, 'H1')
+        m30_struct = compute_timeframe_structure(m30_data, 'M30')
+        m15_struct = compute_timeframe_structure(m15_data, 'M15')
+        m10_struct = compute_timeframe_structure(m10, 'M10')
+
+        htf_swings = (h1_struct or {}).get('swings') or find_swings(h1) if not h1.empty else find_swings(m10)
+        htf_order_blocks = (h1_struct or {}).get('order_blocks') or []
+        htf_fvgs = (h1_struct or {}).get('fvgs') or []
+        atr_htf = (h1_struct or {}).get('atr') or calculate_atr(m10)
+
+        ltf_swings = (m15_struct or {}).get('swings') or find_swings(m10)
+        ltf_order_blocks = (m15_struct or {}).get('order_blocks') or detect_order_blocks(m10)
+        ltf_fvgs = (m15_struct or {}).get('fvgs') or detect_fvg(m10)
+        atr_ltf = (m15_struct or {}).get('atr') or calculate_atr(m10)
+
+        candles = (m15_struct or {}).get('candles') or analyze_candle_structure(m10)
+        # `swings` stays as the name every downstream direction-guard function expects — it is
+        # now the HTF (H1) swing set, consistent with "HTF decides direction".
+        swings = htf_swings
+
         pair_config = get_pair_config(symbol)
         
         dxy_data = all_data.get('DXY', {}).get('H1', pd.DataFrame())
@@ -2890,71 +3013,60 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         if picture:
             firm, firm_notes = resolve_firm_direction(symbol, picture)
             
-        phase_context = detect_market_phase(m10, swings=swings)
-        setup_context = build_setup_context(m10, swings, current_price, symbol, dxy_context=dxy_context)
-        structural_context = calculate_structural_score(m10, symbol, dxy_context=dxy_context, phase_context=phase_context)
-        candles = analyze_candle_structure(m10)
+        # Bias-defining context now comes from H1 (was M10) — market phase / setup type / the
+        # Python structural score are all directional classifications and belong on the
+        # timeframe the direction is actually decided on.
+        phase_context = detect_market_phase(h1 if not h1.empty else m10, swings=htf_swings)
+        setup_context = build_setup_context(h1 if not h1.empty else m10, htf_swings, current_price, symbol, dxy_context=dxy_context)
+        # entry_quality/entry_timing are an LTF (M15) question — is a pullback happening right
+        # now — so they're overridden here from a dedicated LTF pass rather than the HTF one.
+        ltf_setup_context = build_setup_context(m15_data if not m15_data.empty else m10, ltf_swings, current_price, symbol, dxy_context=None)
+        setup_context['entry_quality'] = ltf_setup_context.get('entry_quality', setup_context.get('entry_quality'))
+        setup_context['entry_timing'] = ltf_setup_context.get('entry_timing', setup_context.get('entry_timing'))
+        structural_context = calculate_structural_score(h1 if not h1.empty else m10, symbol, dxy_context=dxy_context, phase_context=phase_context)
         
-        bos, choch = detect_bos_choch(m10)
-        order_blocks = detect_order_blocks(m10)
-        fvgs = detect_fvg(m10)
-        sweeps = detect_liquidity_sweeps(m10)
-        
-        structure_parts = []
-        if bos or choch: structure_parts.append(f"BOS/CHOCH: {bos or choch}")
-        if order_blocks: structure_parts.append("Order blocks: " + ", ".join([f"{ob['type']}@{ob['price']:.2f}" for ob in order_blocks]))
-        if fvgs: structure_parts.append("FVGs: " + ", ".join([f"{fvg['type']}({fvg['top']:.2f}->{fvg['bottom']:.2f})" for fvg in fvgs]))
-        if sweeps: structure_parts.append("Sweeps: " + ", ".join([f"{s['type']}@{s['price']:.2f}" for s in sweeps]))
-        if candles: structure_parts.append("Recent candles: " + "; ".join([f"{c['time'].strftime('%H:%M')} {c['pattern']} ({c['candle_type']})" for c in candles]))
-        structure_context = " | ".join(structure_parts) if structure_parts else "No strong structural clues detected."
-        
-        market_structure_summary = build_market_structure_summary(m10, current_price=current_price, swings=swings, order_blocks=order_blocks, fvgs=fvgs, sweeps=sweeps, bos=bos, choch=choch, symbol=symbol)
-        multitimeframe_context = build_multitimeframe_context(all_data, symbol)
+        htf_structure_text = build_htf_structure_block(h4_struct, h1_struct, h1, current_price, pair_config)
+        ltf_structure_text = build_ltf_entry_block(m30_struct, m15_struct, m10_struct, current_price, pair_config)
         rsi_values = build_rsi_values_context(all_data, symbol)
-        premium_discount = build_premium_discount_context(m10, current_price)
-        volatility_context = build_volatility_context(m10)
+        volatility_context = (
+            f"LTF (M15, entry-timing) ATR {atr_ltf:.5f} | HTF (H1, risk-sizing) ATR {atr_htf:.5f}."
+            if atr_ltf and atr_htf else "ATR unavailable."
+        )
         
-        ledger = detect_directional_confluence(m10, swings=swings, htf_context=htf_context, dxy_context=dxy_context, symbol=symbol)
+        # Directional evidence ledger now runs on H1 (was M10) — this is the primary vote that
+        # decides BUY vs SELL, so it needs to be built on a timeframe that isn't noise.
+        ledger = detect_directional_confluence(h1 if not h1.empty else m10, swings=htf_swings, htf_context=htf_context, dxy_context=dxy_context, symbol=symbol)
         directional_ledger = f"Bullish ({ledger['bull_count']}): {'; '.join(ledger['bullish_evidence']) or 'none'} | Bearish ({ledger['bear_count']}): {'; '.join(ledger['bearish_evidence']) or 'none'} | Ledger direction: {ledger['direction'] or 'none'}"
         
-        rsi_context = ''
-        if not m10.empty:
-            divergence = detect_rsi_divergence(m10)
-            rsi_context = f"M10 RSI context: {divergence['type']} - {divergence['reason']}" if divergence else 'M10 RSI context: no clear divergence detected.'
-            
-        m15_data = data.get('M15', pd.DataFrame())
-        m30_data = data.get('M30', pd.DataFrame())
-        for label, frame in [('M15', m15_data), ('M30', m30_data), ('H1', h1)]:
-            if frame is not None and not getattr(frame, 'empty', True):
-                d = detect_rsi_divergence(frame)
-                if d:
-                    rsi_context += f" | {label} RSI context: {d['type']} - {d['reason']}"
-        if not rsi_context:
-            rsi_context = 'RSI context unavailable.'
+        rsi_context = f"H1 RSI div: {h1_struct['divergence']['type']} - {h1_struct['divergence']['reason']}" if h1_struct and h1_struct.get('divergence') else "H1 RSI div: none."
+        rsi_context += f" | M15 RSI div: {m15_struct['divergence']['type']} - {m15_struct['divergence']['reason']}" if m15_struct and m15_struct.get('divergence') else " | M15 RSI div: none."
             
         h1_summary = f"Latest H1 close: {h1['Close'].iloc[-1]:.2f}" if not h1.empty else "H1 data unavailable"
         h4_summary = f"Latest H4 close: {h4['Close'].iloc[-1]:.2f}" if not h4.empty else "H4 data unavailable"
         htf_summary = f"H1: {h1_summary} | H4: {h4_summary}"
         
-        prompt_data = f"Symbol: {symbol} | Live Price: {current_price} | Live Price Source: {live_snapshot.get('source')} | Quote Time: {live_snapshot.get('quote_time', 'N/A')} | Swing Highs: {swings['recent_swing_highs']} | Swing Lows: {swings['recent_swing_lows']} | Market Phase: {phase_context['phase']} | Phase Reason: {phase_context['reason']} | Setup Type: {setup_context['setup_type']} | Entry Timing: {setup_context['entry_timing']} | Entry Quality: {phase_context['entry_quality']} | Entry Rule: propose a resting LIMIT order at a genuine pullback level inside the entry-gap band; never at or near the live price."
+        prompt_data = f"Symbol: {symbol} | Live Price: {current_price} | Live Price Source: {live_snapshot.get('source')} | Quote Time: {live_snapshot.get('quote_time', 'N/A')} | Market Phase (H1): {phase_context['phase']} | Phase Reason: {phase_context['reason']} | Setup Type (H1): {setup_context['setup_type']} | Entry Timing (M15): {setup_context['entry_timing']} | Entry Quality (M15): {setup_context['entry_quality']} | Entry Rule: propose a resting LIMIT order at a genuine M15/M30 pullback level inside the entry-gap band; never at or near the live price."
         prompt_micro = f"VWAP: {micro.get('vwap', 'N/A')} | Price vs VWAP: {micro.get('price_vs_vwap', 'N/A')} | RVOL: {micro.get('rvol', 'N/A')} ({micro.get('volume_anomaly', 'N/A')})"
-        structural_score_context = f"Python structural score: {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
+        structural_score_context = f"Python structural score (H1-based): {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
         historical_context = build_historical_context(m10)
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
-        atr_for_entry = setup_context.get('atr')
-        min_gap, max_gap = get_entry_gap_bounds(current_price, atr_for_entry, pair_config)
+        min_gap, max_gap = get_entry_gap_bounds(current_price, atr_ltf, pair_config)
         max_entry_distance = (
             f"Entry must be between {min_gap:.5f} and {max_gap:.5f} price-units away from the live quote "
             f"({symbol}) — below live price for BUY LIMIT, above it for SELL LIMIT. Closer than "
             f"{min_gap:.5f} is a disguised market order and will be rejected and rebuilt; farther than "
             f"{max_gap:.5f} is unrealistic and will be rejected and rebuilt."
         )
-        candidate_levels = build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr_for_entry, pair_config, vwap=micro.get('vwap'))
+        candidate_levels = build_candidate_levels(
+            symbol, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
+            htf_swings, htf_order_blocks, htf_fvgs, atr_htf, pair_config,
+            vwap=micro.get('vwap'), htf_df=h1 if not h1.empty else None
+        )
         
         all_format_kwargs = {
-            'data_summary': prompt_data, 'microstructure_data': prompt_micro, 'structure_context': structure_context,
-            'market_structure_summary': market_structure_summary, 'multitimeframe_context': multitimeframe_context,
-            'rsi_values': rsi_values, 'rsi_context': rsi_context, 'premium_discount': premium_discount,
+            'data_summary': prompt_data, 'microstructure_data': prompt_micro,
+            'htf_structure': htf_structure_text, 'ltf_structure': ltf_structure_text,
+            'rsi_values': rsi_values, 'rsi_context': rsi_context,
             'volatility_context': volatility_context, 'htf_context': htf_summary, 'dxy_data': dxy_summary,
             'historical_context': historical_context, 'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger, 'firm_bias': firm_bias_text,
@@ -3034,7 +3146,7 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             analysis['confidence'] = 'HIGH'
             
         analysis['structural_score'] = structural_context['structural_score']
-        analysis['atr'] = setup_context.get('atr')
+        analysis['atr'] = atr_htf
         analysis['score_reason'] = structural_context['score_reason']
         analysis['candidate_direction'] = structural_context['candidate_direction']
         
@@ -3056,9 +3168,10 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         analysis = apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, current_price, swings, symbol, pair_config=pair_config)
         
         analysis = finalize_trade_plan(
-            analysis=analysis, symbol=symbol, current_price=current_price, swings=swings,
-            order_blocks=order_blocks, fvgs=fvgs, atr=setup_context.get('atr'),
-            pair_config=pair_config, market_df=m10
+            analysis=analysis, symbol=symbol, current_price=current_price,
+            ltf_swings=ltf_swings, ltf_order_blocks=ltf_order_blocks, ltf_fvgs=ltf_fvgs, atr_ltf=atr_ltf,
+            htf_swings=htf_swings, htf_order_blocks=htf_order_blocks, htf_fvgs=htf_fvgs, atr_htf=atr_htf,
+            pair_config=pair_config, htf_df=h1 if not h1.empty else None, ltf_df=m15_data if not m15_data.empty else m10
         )
         
         if analysis.get('signal') in ('BUY', 'SELL') and analysis.get('take_profit'):
@@ -3071,10 +3184,10 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 try:
                     tp1 = analysis['take_profit'][0]
                     next_level = build_exhaustion_target(
-                        analysis['signal'], tp1, m10, swings, order_blocks, fvgs,
-                        setup_context.get('atr'), pair_config
+                        analysis['signal'], tp1, h1 if not h1.empty else m10, htf_swings, htf_order_blocks, htf_fvgs,
+                        atr_htf, pair_config
                     )
-                    if next_level and abs(next_level - tp1) > (setup_context.get('atr') or 0) * 0.1:
+                    if next_level and abs(next_level - tp1) > (atr_htf or 0) * 0.1:
                         analysis['next_level_watch'] = (
                             f"Beyond TP1, the next level in play is ~{round_price(next_level, pair_config)} "
                             f"— watch for price to approach it if {symbol} continues {analysis['signal'].lower()}ing "
