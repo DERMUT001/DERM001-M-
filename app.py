@@ -1,31 +1,34 @@
 # =============================================================================
-# Der-AI | Institutional Market Analysis — UPGRADED BUILD
+# Der-AI | Institutional Market Analysis — V3 "STRUCTURE-LOCKED" BUILD
 #
-# Changes vs. the previous version (see chat for full root-cause analysis):
-#   1. call_groq() now ALWAYS tries GROQ_MODELS in the exact configured order.
-#      The old get_groq_models() discovery call used to silently re-filter/drop
-#      the primary model before it was ever tried if Groq's /models endpoint
-#      didn't happen to list it — that was the actual cause of "it skips model
-#      1 and uses model 3". Discovery is now diagnostic-only (Settings tab).
-#   2. Each model gets its own max_completion_tokens + reasoning_effort
-#      (openai/gpt-oss-120b: 4000 tokens, reasoning_effort='low') instead of a
-#      single 950-token cap, which was starving the reasoning model of room to
-#      finish its JSON output.
-#   3. Every signal is now a genuine resting LIMIT order inside a real
-#      min/max "entry gap" band (get_entry_gap_bounds / compute_default_limit_
-#      entry). The old code capped that band so tight (~0.25% / 0.9 ATR) that
-#      any real pullback level got rejected and silently replaced with a
-#      market-price entry + order_type='MARKET'. That fallback is gone.
-#   4. No more WAIT signals anywhere in the resolved output — every dead end
-#      (missing AI entry, failed structural plan, failed final validation)
-#      now resolves through build_atr_fallback_plan() to a deterministic,
-#      risk-defined BUY/SELL LIMIT instead of surrendering.
-#   5. Added next_level_watch (AI-populated, with a Python-computed fallback)
-#      so each signal also states the next structural level price may
-#      approach beyond TP.
-#   6. Settings tab now shows per-model call diagnostics and a live Groq
-#      /models check, so you can see exactly what happened on any given run.
+# Why V2 flipped BUY -> SELL within ~3 hours (root causes found in the previous build):
+#   1. Direction was a weighted vote in which M10/M15/M30 (combined weight 3.5) nearly
+#      out-voted H1/H4 (5.0), so ten-minute noise could flip the call.
+#   2. "Order blocks", "FVGs" and "swings" were computed from only the last 2-3 candles (or a
+#      4-swing window) and INCLUDING the still-forming candle, so every level moved with
+#      every new high/low — the entry price was rebuilt from scratch on every run.
+#   3. The bias-hold rule (45 min) lived only in st.session_state, so it was lost whenever the
+#      session restarted, and the AI was free to override the firm bias anyway.
+#   4. The entry band was so tight that genuine HTF zones were rejected and replaced by
+#      whatever LTF level was nearest to live price.
+#
+# What V3 does instead:
+#   * Direction comes from H4 + H1 ONLY (confirmed pivots, HH/HL/LH/LL, close-based BOS/CHOCH,
+#     EMA trend, RSI regime, DXY filter) and is protected by PERSISTENT hysteresis.
+#   * Structure uses CLOSED candles only; order blocks require displacement + a structure break
+#     and are mitigation-aware; FVGs track how much is still unfilled; swept swings are retired;
+#     equal highs/lows and PDH/PDL/PWH/PWL are tracked as liquidity.
+#   * The limit entry is chosen from ranked HTF zones (H4/H1 OB, FVG, OTE, swings, liquidity),
+#     then refined by M30/M15 structure INSIDE the zone. SL/TP are structural (TP1/TP2 = next
+#     opposing HTF levels paying >= 1.5R).
+#   * PLAN LOCK: one plan per symbol is created and managed (pending/filled/TP/SL/missed/expired/
+#     stale/cancelled) — re-running returns the same plan; it is replaced only when it resolves
+#     or the HTF bias genuinely flips. Results are tracked in a ledger with win rate and net R.
+#   * The AI is now an AUDITOR: it cannot change direction or levels; it flags risks, reads chart
+#     screenshots and adjusts the transparent 100-point Python score by at most +/-6.
+#   * Keeps everything from V2: Groq model order, per-model token budgets, Telegram, LIMIT-only.
 # =============================================================================
+
 import os, json, requests, time, re, random, traceback, uuid, html, base64, io
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,7 +68,6 @@ def get_secret(name, default=""):
     except Exception:
         pass
     return os.environ.get(name, default)
-
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID", "")
 SYMBOLS = ['XAUUSD', 'EURUSD', 'BTCUSD', 'US30']
@@ -101,7 +103,8 @@ GROQ_DEFAULT_MODEL_CONFIG = {'max_completion_tokens': 2000, 'reasoning_effort': 
 GROQ_MAX_OUTPUT_TOKENS = 4000
 GROQ_ESTIMATED_RESPONSE_TOKENS = GROQ_MAX_OUTPUT_TOKENS
 
-PYTHON_FALLBACK_MODEL = 'Python fallback (rule-based MTF confluence)'
+
+PYTHON_FALLBACK_MODEL = 'Python structure engine'
 
 if 'signal_history' not in st.session_state: st.session_state.signal_history = []
 if 'notifications' not in st.session_state: st.session_state.notifications = []
@@ -120,6 +123,11 @@ if 'groq_rate_limit_until' not in st.session_state: st.session_state.groq_rate_l
 if 'groq_rate_limit_reason' not in st.session_state: st.session_state.groq_rate_limit_reason = ''
 if 'cached_analysis' not in st.session_state: st.session_state.cached_analysis = {}
 if 'last_model_attempts' not in st.session_state: st.session_state.last_model_attempts = {}
+
+if 'persist_state' not in st.session_state: st.session_state.persist_state = None
+if 'min_send_score' not in st.session_state: st.session_state.min_send_score = MINIMUM_CONFLUENCE_SCORE
+if 'send_low_conviction' not in st.session_state: st.session_state.send_low_conviction = False
+if 'notify_plan_events' not in st.session_state: st.session_state.notify_plan_events = True
 
 def add_notification(note_type, message, symbol=None, signal=None, score=None):
     if 'notifications' not in st.session_state:
@@ -176,27 +184,6 @@ def send_telegram_message(message):
         print(f"Telegram error: {e}")
         return False
 
-def build_telegram_signal_message(symbol, result):
-    tp_values = result.get('take_profit', [])
-    tp_value = tp_values[0] if tp_values else 'N/A'
-    score = result.get('confluence_score', 0)
-    signal = normalize_ai_signal(result.get('signal'))
-    signal = _escape_telegram_html(signal)
-    reasoning = _escape_telegram_html(result.get('reasoning'))
-    order_type = _escape_telegram_html(result.get('order_type', 'LIMIT'))
-    model = _escape_telegram_html(result.get('model_used', 'Unknown'))
-    tokens = result.get('total_tokens', 'N/A')
-    return (
-        f"🌍 <b>DER-AI MARKET SIGNAL</b>\n"
-        f"📊 <b>{_escape_telegram_html(symbol)}</b> - {signal}\n"
-        f"🤖 Model: {model} | 📈 Score: {score}/100 | 🔋 Tokens: {tokens}\n"
-        f"🧾 Order: {order_type}\n"
-        f"💰 Entry: {_escape_telegram_html(result.get('entry'))} | 🛑 SL: {_escape_telegram_html(result.get('stop_loss'))} | 🎯 TP: {_escape_telegram_html(tp_value)}\n"
-        f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}\n"
-        f"🧠 {reasoning}"
-    )
-
-# ── Data Fetching & SMC Engines (Complete Original Logic) ──────────────────
 def _build_dataframe_from_records(records):
     if not records:
         return pd.DataFrame()
@@ -215,15 +202,18 @@ def _build_dataframe_from_records(records):
             df[col] = pd.to_numeric(df[col], errors='coerce')
     return df.dropna()
 
-def fetch_candles_from_bitfinex(symbol, interval, limit=200):
+
+def fetch_candles_from_bitfinex(symbol, interval, limit=None):
     pair_map = {'BTCUSD': 'tBTCUSD', 'XAUUSD': 'tXAUT:USD', 'EURUSD': 'tEURUSD', 'DXY': None}
     bitfinex_symbol = pair_map.get(symbol)
     if not bitfinex_symbol:
         return pd.DataFrame()
-    interval_map = {'15m': '15m', '30m': '30m', '60m': '1h', '1h': '1h', '4h': '4h'}
+    interval_map = {'5m': '5m', '15m': '15m', '30m': '30m', '60m': '1h', '1h': '1h', '4h': '4h'}
+    default_limits = {'5m': 1000, '15m': 600, '30m': 500, '1h': 700, '4h': 400}
     interval_code = interval_map.get(interval)
     if not interval_code:
         return pd.DataFrame()
+    limit = int(limit or default_limits.get(interval_code, 300))
     try:
         url = f'https://api-pub.bitfinex.com/v2/candles/trade:{interval_code}:{bitfinex_symbol}/hist?limit={limit}'
         response = requests.get(url, timeout=20)
@@ -237,12 +227,8 @@ def fetch_candles_from_bitfinex(symbol, interval, limit=200):
                 continue
             ts, open_price, close_price, high_price, low_price, volume = item[:6]
             records.append({
-                'timestamp': ts,
-                'Open': float(open_price),
-                'High': float(high_price),
-                'Low': float(low_price),
-                'Close': float(close_price),
-                'Volume': float(volume)
+                'timestamp': ts, 'Open': float(open_price), 'High': float(high_price),
+                'Low': float(low_price), 'Close': float(close_price), 'Volume': float(volume)
             })
         return _build_dataframe_from_records(records)
     except Exception as exc:
@@ -255,7 +241,7 @@ def fetch_ohlcv(yf_symbol, interval, period):
         return pd.DataFrame()
     for symbol in ['BTCUSD', 'XAUUSD', 'EURUSD', 'DXY']:
         if yf_symbol in {symbol, YFINANCE_MAP.get(symbol, symbol)}:
-            direct_df = fetch_candles_from_bitfinex(symbol, interval, limit=250)
+            direct_df = fetch_candles_from_bitfinex(symbol, interval)
             if not direct_df.empty:
                 return direct_df
             break
@@ -273,7 +259,15 @@ def fetch_ohlcv(yf_symbol, interval, period):
         for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna()
+        df = df.dropna(subset=['Open', 'High', 'Low', 'Close'])
+        if 'Volume' not in df.columns:
+            df['Volume'] = 0.0
+        df['Volume'] = df['Volume'].fillna(0.0)
+        # Normalise every index to tz-aware UTC so closed-candle logic, day anchoring and plan
+        # tracking behave identically across data sources.
+        idx = pd.to_datetime(df.index)
+        df.index = idx.tz_localize('UTC') if idx.tz is None else idx.tz_convert('UTC')
+        df = df.sort_index()
         return df if len(df) >= 5 else pd.DataFrame()
     except Exception as e:
         print(f"⚠️ Yahoo fetch failed for {yf_symbol} [{interval}/{period}]: {e}")
@@ -281,11 +275,11 @@ def fetch_ohlcv(yf_symbol, interval, period):
 
 def fetch_symbol_data(symbol, yf_symbol):
     df_m10 = pd.DataFrame()
-    for interval, period in [('10m', '5d'), ('15m', '5d')]:
-        df_candidate = fetch_ohlcv(yf_symbol, interval, period)
-        if not df_candidate.empty:
-            df_m10 = df_candidate
-            break
+    # True M10 = two 5m bars (the old code asked Yahoo for '10m', which doesn't exist, and
+    # silently fell back to M15 while still calling it M10).
+    df5 = fetch_ohlcv(yf_symbol, '5m', '5d')
+    if df5 is not None and not df5.empty and len(df5) >= 60:
+        df_m10 = resample_ohlcv(df5, '10min')
     if df_m10.empty:
         for interval, period in [('15m', '5d'), ('30m', '5d'), ('60m', '5d')]:
             df_candidate = fetch_ohlcv(yf_symbol, interval, period)
@@ -310,6 +304,7 @@ def fetch_symbol_data(symbol, yf_symbol):
     df_h4 = fetch_ohlcv(yf_symbol, '4h', '3mo')
     if df_h4.empty:
         df_h4 = fetch_ohlcv(yf_symbol, '1d', '6mo')
+    df_h4 = ensure_h4(df_h1, df_h4)
     if df_m10.empty and not df_m15.empty:
         df_m10 = df_m15
     if df_m30.empty and not df_h1.empty:
@@ -332,380 +327,6 @@ def fetch_all_data():
                 data[symbol] = {'M10': pd.DataFrame(), 'H1': pd.DataFrame(), 'H4': pd.DataFrame()}
     return data
 
-def calculate_microstructure(df):
-    if df is None or len(df) < 2:
-        return {}
-    try:
-        typical_price = (pd.to_numeric(df['High'], errors='coerce') + pd.to_numeric(df['Low'], errors='coerce') + pd.to_numeric(df['Close'], errors='coerce')) / 3
-        volume = pd.to_numeric(df['Volume'], errors='coerce').fillna(0)
-        cumulative_tp_vol = (typical_price * volume).cumsum()
-        cumulative_vol = volume.cumsum()
-        vwap = cumulative_tp_vol / cumulative_vol.replace(0, np.nan)
-        current_vwap = float(vwap.iloc[-1])
-        current_price = float(pd.to_numeric(df['Close'], errors='coerce').iloc[-1])
-        avg_volume = volume.rolling(window=min(20, len(volume))).mean().iloc[-1]
-        current_volume = float(volume.iloc[-1])
-        rvol = current_volume / avg_volume if avg_volume > 0 else 1.0
-        anchor_index = -min(5, len(df))
-        price_change = current_price - float(pd.to_numeric(df['Close'], errors='coerce').iloc[anchor_index])
-        return {
-            "vwap": round(current_vwap, 2),
-            "price_vs_vwap": "ABOVE" if current_price > current_vwap else "BELOW",
-            "rvol": round(rvol, 2),
-            "volume_anomaly": "HIGH_INSTITUTIONAL" if rvol > 2.0 else "NORMAL",
-            "momentum": "BULLISH" if price_change > 0 else "BEARISH"
-        }
-    except Exception:
-        return {}
-
-def detect_bos_choch(df):
-    if df is None or len(df) < 2:
-        return None, None
-    try:
-        highs = pd.to_numeric(df['High'], errors='coerce').dropna()
-        lows = pd.to_numeric(df['Low'], errors='coerce').dropna()
-        if highs.empty or lows.empty or len(df) < 4:
-            return None, None
-        recent_high = float(highs.iloc[-1])
-        prev_high = float(highs.iloc[-2]) if len(highs) >= 2 else recent_high
-        recent_low = float(lows.iloc[-1])
-        prev_low = float(lows.iloc[-2]) if len(lows) >= 2 else recent_low
-        bos, choch = None, None
-        if recent_high > prev_high * 1.001:
-            bos = "BULLISH_BOS"
-        elif recent_low < prev_low * 0.999:
-            bos = "BEARISH_BOS"
-        if bos == "BULLISH_BOS" and recent_low > prev_low:
-            choch = "BULLISH_CHOCH"
-        elif bos == "BEARISH_BOS" and recent_high < prev_high:
-            choch = "BEARISH_CHOCH"
-        return bos, choch
-    except Exception:
-        return None, None
-
-def find_swings(df, window=5):
-    highs = df['High'].rolling(window * 2 + 1, center=True).max()
-    lows = df['Low'].rolling(window * 2 + 1, center=True).min()
-    return {
-        "recent_swing_highs": [round(p, 5) for p in df['High'][df['High'] == highs].tail(4).tolist()],
-        "recent_swing_lows": [round(p, 5) for p in df['Low'][df['Low'] == lows].tail(4).tolist()]
-    }
-
-def detect_order_blocks(df):
-    if len(df) < 5:
-        return []
-    order_blocks = []
-    for i in range(len(df)-3, len(df)):
-        if i < 2:
-            continue
-        candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        if (candle['Close'] > candle['Open'] and
-            (candle['Close'] - candle['Open']) > (candle['High'] - candle['Low']) * 0.6 and
-            prev_candle['Close'] < prev_candle['Open']):
-            order_blocks.append({
-                'type': 'BULLISH_OB',
-                'price': candle['Low'],
-                'strength': 'STRONG' if (candle['Close'] - candle['Open']) > (candle['High'] - candle['Low']) * 0.8 else 'MODERATE'
-            })
-        if (candle['Close'] < candle['Open'] and
-            (candle['Open'] - candle['Close']) > (candle['High'] - candle['Low']) * 0.6 and
-            prev_candle['Close'] > prev_candle['Open']):
-            order_blocks.append({
-                'type': 'BEARISH_OB',
-                'price': candle['High'],
-                'strength': 'STRONG' if (candle['Open'] - candle['Close']) > (candle['High'] - candle['Low']) * 0.8 else 'MODERATE'
-            })
-    return order_blocks[-3:]
-
-def detect_fvg(df):
-    if len(df) < 3:
-        return []
-    fvgs = []
-    for i in range(len(df)-2, len(df)):
-        if i < 2:
-            continue
-        curr, prev, prev2 = df.iloc[i], df.iloc[i-1], df.iloc[i-2]
-        if prev['Low'] > prev2['High'] and curr['Low'] > prev['High']:
-            fvgs.append({'type': 'BULLISH_FVG', 'top': prev['Low'], 'bottom': prev2['High']})
-        if prev['High'] < prev2['Low'] and curr['High'] < prev['Low']:
-            fvgs.append({'type': 'BEARISH_FVG', 'top': prev2['Low'], 'bottom': prev['High']})
-    return fvgs[-2:]
-
-def detect_liquidity_sweeps(df):
-    if len(df) < 10:
-        return []
-    sweeps = []
-    recent = df.tail(10)
-    for i in range(1, len(recent)):
-        candle, prev = recent.iloc[i], recent.iloc[i-1]
-        if (candle['Low'] < prev['Low'] * 0.999 and
-            candle['Close'] > candle['Open'] and
-            (candle['Close'] - candle['Low']) > (candle['High'] - candle['Low']) * 0.6):
-            sweeps.append({
-                'type': 'BULLISH_SWEEP',
-                'price': candle['Low'],
-                'strength': 'STRONG' if (candle['Close'] - candle['Low']) > (candle['High'] - candle['Low']) * 0.8 else 'MODERATE'
-            })
-        if (candle['High'] > prev['High'] * 1.001 and
-            candle['Close'] < candle['Open'] and
-            (candle['High'] - candle['Close']) > (candle['High'] - candle['Low']) * 0.6):
-            sweeps.append({
-                'type': 'BEARISH_SWEEP',
-                'price': candle['High'],
-                'strength': 'STRONG' if (candle['High'] - candle['Close']) > (candle['High'] - candle['Low']) * 0.8 else 'MODERATE'
-            })
-    return sweeps[-2:]
-
-def calculate_atr(df, period=14):
-    if len(df) < period + 2:
-        return None
-    high_low = df['High'] - df['Low']
-    high_close = (df['High'] - df['Close'].shift()).abs()
-    low_close = (df['Low'] - df['Close'].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean().iloc[-1]
-    return float(atr) if pd.notna(atr) else None
-
-def calculate_rsi(series, period=14):
-    if series is None:
-        return pd.Series(dtype=float)
-    original = pd.Series(series)
-    if len(original) < 2:
-        return pd.Series([np.nan] * len(original), index=original.index, dtype=float)
-    series = pd.to_numeric(original, errors='coerce').dropna()
-    if series.empty:
-        return pd.Series([np.nan] * len(original), index=original.index, dtype=float)
-    delta = series.diff()
-    gains = delta.clip(lower=0)
-    losses = (-delta).clip(lower=0)
-    window = min(period, len(series))
-    avg_gain = gains.rolling(window=window, min_periods=1).mean()
-    avg_loss = losses.rolling(window=window, min_periods=1).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.reindex(original.index, fill_value=50).astype(float)
-
-def detect_rsi_divergence(df, period=14):
-    if df is None or df.empty:
-        return None
-    closes = pd.to_numeric(df['Close'], errors='coerce').dropna()
-    if closes.empty or len(closes) < 4:
-        return None
-    rsi = calculate_rsi(closes, period=period)
-    if rsi.empty:
-        return None
-    pivot_highs = []
-    pivot_lows = []
-    for i in range(2, len(closes) - 2):
-        prev2 = closes.iloc[i - 2]
-        prev1 = closes.iloc[i - 1]
-        curr = closes.iloc[i]
-        next1 = closes.iloc[i + 1]
-        next2 = closes.iloc[i + 2]
-        if curr >= prev1 and curr >= next1 and curr >= prev2 and curr >= next2:
-            pivot_highs.append((i, float(curr), float(rsi.iloc[i])))
-        if curr <= prev1 and curr <= next1 and curr <= prev2 and curr <= next2:
-            pivot_lows.append((i, float(curr), float(rsi.iloc[i])))
-    if len(pivot_highs) >= 2:
-        prev_high = pivot_highs[-2]
-        curr_high = pivot_highs[-1]
-        if curr_high[1] < prev_high[1] and curr_high[2] > prev_high[2]:
-            return {'type': 'BULLISH_DIV', 'reason': 'Price is printing a lower high while RSI is holding a higher high, suggesting bullish divergence.'}
-        if curr_high[1] > prev_high[1] and curr_high[2] < prev_high[2]:
-            return {'type': 'BEARISH_DIV', 'reason': 'Price is printing a higher high while RSI is failing, suggesting bearish divergence.'}
-    if len(pivot_lows) >= 2:
-        prev_low = pivot_lows[-2]
-        curr_low = pivot_lows[-1]
-        if curr_low[1] < prev_low[1] and curr_low[2] > prev_low[2]:
-            return {'type': 'BULLISH_DIV', 'reason': 'Price is printing a lower low while RSI is holding a higher low, suggesting bullish divergence.'}
-        if curr_low[1] > prev_low[1] and curr_low[2] < prev_low[2]:
-            return {'type': 'BEARISH_DIV', 'reason': 'Price is printing a higher low while RSI is weakening, suggesting bearish divergence.'}
-    last_close = float(closes.iloc[-1])
-    prev_close = float(closes.iloc[-2])
-    last_rsi = float(rsi.iloc[-1])
-    prev_rsi = float(rsi.iloc[-2])
-    if last_close < prev_close and last_rsi > prev_rsi:
-        return {'type': 'BULLISH_DIV', 'reason': 'The latest candles show a bullish RSI divergence against the recent price decline.'}
-    if last_close > prev_close and last_rsi < prev_rsi:
-        return {'type': 'BEARISH_DIV', 'reason': 'The latest candles show a bearish RSI divergence against the recent price advance.'}
-    if len(closes) >= 6:
-        lookback = min(5, len(closes) - 1)
-        price_change = float(closes.iloc[-1] - closes.iloc[-lookback - 1])
-        rsi_change = float(rsi.iloc[-1] - rsi.iloc[-lookback - 1])
-        if price_change <= 0 and rsi_change > 0:
-            return {'type': 'BULLISH_DIV', 'reason': 'Price is failing to continue lower while RSI is rising, which is bullish divergence.'}
-        if price_change >= 0 and rsi_change < 0:
-            return {'type': 'BEARISH_DIV', 'reason': 'Price is pushing higher while RSI is weakening, which is bearish divergence.'}
-    return None
-
-def detect_reversal(df):
-    if len(df) < 8:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prev2 = df.iloc[-3]
-    body = abs(last['Close'] - last['Open'])
-    total_range = last['High'] - last['Low']
-    if total_range == 0:
-        return None
-    wick_ratio = max(last['High'] - max(last['Open'], last['Close']), min(last['Open'], last['Close']) - last['Low']) / total_range
-    body_ratio = body / total_range
-    bullish_reversal = last['Close'] > last['Open'] and last['Close'] >= prev['Close'] and wick_ratio > 0.45 and body_ratio < 0.45 and last['Low'] <= min(prev['Low'], prev2['Low'])
-    bearish_reversal = last['Close'] < last['Open'] and last['Close'] <= prev['Close'] and wick_ratio > 0.45 and body_ratio < 0.45 and last['High'] >= max(prev['High'], prev2['High'])
-    if bullish_reversal or bearish_reversal:
-        return {
-            'type': 'BULLISH_REVERSAL' if bullish_reversal else 'BEARISH_REVERSAL',
-            'direction': 'BUY' if bullish_reversal else 'SELL',
-            'strength': 'STRONG' if wick_ratio > 0.6 else 'MODERATE',
-            'reason': 'The market is rejecting a previous extreme and showing a clean reversal candle.'
-        }
-    return None
-
-def detect_continuation(df):
-    if len(df) < 8:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    recent_high = max(df['High'].tail(4).iloc[:-1])
-    recent_low = min(df['Low'].tail(4).iloc[:-1])
-    bullish_continuation = last['Close'] > prev['Close'] and last['Close'] > recent_high and last['Low'] > recent_low
-    bearish_continuation = last['Close'] < prev['Close'] and last['Close'] < recent_low and last['High'] < recent_high
-    if bullish_continuation or bearish_continuation:
-        return {
-            'type': 'BULLISH_CONTINUATION' if bullish_continuation else 'BEARISH_CONTINUATION',
-            'direction': 'BUY' if bullish_continuation else 'SELL',
-            'strength': 'STRONG' if abs(last['Close'] - prev['Close']) > (last['High'] - last['Low']) * 0.5 else 'MODERATE',
-            'reason': 'Price is extending beyond the recent range with follow-through, supporting continuation.'
-        }
-    return None
-
-def detect_exhaustion(df):
-    if len(df) < 8:
-        return None
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    body = abs(last['Close'] - last['Open'])
-    total_range = last['High'] - last['Low']
-    if total_range == 0:
-        return None
-    wick = max(last['High'] - max(last['Open'], last['Close']), min(last['Open'], last['Close']) - last['Low'])
-    wick_ratio = wick / total_range
-    body_ratio = body / total_range
-    vol = float(last['Volume']) if 'Volume' in df.columns else 0.0
-    avg_vol = float(df['Volume'].tail(10).mean()) if 'Volume' in df.columns else 0.0
-    volume_spike = vol / avg_vol if avg_vol > 0 else 1.0
-    bullish_exhaustion = last['Close'] > prev['Close'] and wick_ratio > 0.55 and body_ratio < 0.35 and volume_spike > 1.1
-    bearish_exhaustion = last['Close'] < prev['Close'] and wick_ratio > 0.55 and body_ratio < 0.35 and volume_spike > 1.1
-    if bullish_exhaustion or bearish_exhaustion:
-        return {
-            'type': 'BULLISH_EXHAUSTION' if bullish_exhaustion else 'BEARISH_EXHAUSTION',
-            'direction': None,
-            'strength': 'STRONG' if volume_spike > 1.3 else 'MODERATE',
-            'reason': 'Price made a stretched wick into the current bar and closed with a weak body, signaling exhaustion.'
-        }
-    return None
-
-def assess_entry_quality(df, swings, current_price, signal):
-    if not swings:
-        return {'entry_quality': 'unknown', 'entry_zone': None, 'distance_pct': None}
-    if signal == 'BUY':
-        swing_lows = [level for level in swings.get('recent_swing_lows', []) if level < current_price]
-        zone = swing_lows[0] if swing_lows else None
-        if zone is None:
-            return {'entry_quality': 'unknown', 'entry_zone': None, 'distance_pct': None}
-        distance_pct = abs(current_price - zone) / current_price
-        quality = 'early' if distance_pct < 0.003 else 'acceptable' if distance_pct < 0.008 else 'late'
-        return {'entry_quality': quality, 'entry_zone': zone, 'distance_pct': round(distance_pct, 6)}
-    swing_highs = [level for level in swings.get('recent_swing_highs', []) if level > current_price]
-    zone = swing_highs[0] if swing_highs else None
-    if zone is None:
-        return {'entry_quality': 'unknown', 'entry_zone': None, 'distance_pct': None}
-    distance_pct = abs(zone - current_price) / current_price
-    quality = 'early' if distance_pct < 0.003 else 'acceptable' if distance_pct < 0.008 else 'late'
-    return {'entry_quality': quality, 'entry_zone': zone, 'distance_pct': round(distance_pct, 6)}
-
-def detect_market_phase(df, swings=None):
-    micro = calculate_microstructure(df)
-    continuation = detect_continuation(df)
-    reversal = detect_reversal(df)
-    exhaustion = detect_exhaustion(df)
-    divergence = detect_rsi_divergence(df)
-    entry_quality = assess_entry_quality(df, swings, df['Close'].iloc[-1], 'BUY' if micro.get('momentum') == 'BULLISH' else 'SELL') if swings is not None else {'entry_quality': 'unknown'}
-    direction = None
-    if continuation:
-        phase = 'continuation'
-        reason = continuation['reason']
-        direction = continuation.get('direction')
-    elif reversal:
-        phase = 'reversal'
-        reason = reversal['reason']
-        direction = reversal.get('direction')
-    elif exhaustion:
-        phase = 'exhaustion'
-        reason = exhaustion['reason']
-    elif micro.get('momentum') == 'BULLISH' and micro.get('price_vs_vwap') == 'ABOVE':
-        phase = 'trend'
-        reason = 'Price is holding above VWAP with positive momentum and is still in a directional trend.'
-        direction = 'BUY'
-    elif micro.get('momentum') == 'BEARISH' and micro.get('price_vs_vwap') == 'BELOW':
-        phase = 'trend'
-        reason = 'Price is holding below VWAP with negative momentum and is still in a directional trend.'
-        direction = 'SELL'
-    else:
-        phase = 'coiling'
-        reason = 'The market is coiling and lacks a clear continuation or reversal edge yet.'
-    if divergence:
-        direction = 'BUY' if divergence['type'] == 'BULLISH_DIV' else 'SELL'
-        reason += f" RSI divergence hint: {divergence['reason']}"
-    return {
-        'phase': phase,
-        'reason': reason,
-        'direction': direction,
-        'entry_quality': entry_quality.get('entry_quality', 'unknown'),
-        'entry_zone': entry_quality.get('entry_zone'),
-        'distance_pct': entry_quality.get('distance_pct')
-    }
-
-def range_position(df, current_price):
-    if df is None or df.empty:
-        return None
-    look = df.tail(60)
-    hi = float(look['High'].max())
-    lo = float(look['Low'].min())
-    if hi <= lo:
-        return None
-    return (float(current_price) - lo) / (hi - lo), lo, hi
-
-def build_premium_discount_context(m10, current_price):
-    pos_info = range_position(m10, current_price)
-    if not pos_info:
-        return 'Range position unavailable.'
-    pos, lo, hi = pos_info
-    zone = 'PREMIUM (upper half of range - SMC favors sells/shorts here)' if pos >= 0.5 else 'DISCOUNT (lower half of range - SMC favors buys/longs here)'
-    return f"Recent 60-bar range {lo:.2f}-{hi:.2f}; price at {pos * 100:.0f}% of the range => {zone}."
-
-def build_volatility_context(m10):
-    atr = calculate_atr(m10)
-    if atr is None or m10 is None or m10.empty:
-        return 'ATR unavailable.'
-    last = float(m10['Close'].iloc[-1])
-    atr_pct = atr / last * 100 if last else 0.0
-    return f"M10 ATR {atr:.2f} ({atr_pct:.2f}% of price). Judge whether volatility is expanded or compressed versus recent sessions."
-
-def build_historical_context(m10):
-    if m10 is None or m10.empty:
-        return 'Historical context unavailable.'
-    closes = [round(float(v), 4) for v in m10['Close'].tail(10).tolist()]
-    if len(closes) < 2:
-        return 'Historical context unavailable.'
-    latest = float(m10['Close'].iloc[-1])
-    prev = float(m10['Close'].iloc[-2])
-    change_pct = round(((latest - prev) / prev) * 100, 2) if prev else 0.0
-    high = float(m10['High'].tail(20).max())
-    low = float(m10['Low'].tail(20).min())
-    range_pct = round(((high - low) / latest) * 100, 2) if latest else 0.0
-    return f"Last 10 M10 closes: {closes}; latest 1-bar change: {change_pct}%; recent 20-bar range: {range_pct}%."
-
 def compute_rsi_last(series, period=14):
     rsi = calculate_rsi(series, period)
     if rsi is None or rsi.empty:
@@ -727,630 +348,6 @@ def build_rsi_values_context(all_data, symbol):
             state = 'OVERBOUGHT' if v >= 70 else 'OVERSOLD' if v <= 30 else 'neutral'
             parts.append(f"{label} RSI {v} ({state})")
     return ' | '.join(parts) if parts else 'RSI values unavailable.'
-
-def build_market_structure_summary(df, current_price=None, swings=None, order_blocks=None, fvgs=None, sweeps=None, bos=None, choch=None, symbol=None):
-    if df is None or df.empty:
-        return 'Market structure unavailable.'
-    current_price = float(current_price) if current_price is not None else float(df['Close'].iloc[-1])
-    swings = swings or find_swings(df)
-    recent_swing_highs = [float(v) for v in swings.get('recent_swing_highs', []) if v is not None]
-    recent_swing_lows = [float(v) for v in swings.get('recent_swing_lows', []) if v is not None]
-    zone_buffer = max(abs(current_price) * 0.0015, 0.5 if current_price >= 100 else 0.01)
-    support_zones = [f"{max(level - zone_buffer, 0):.2f}-{level + zone_buffer:.2f}" for level in recent_swing_lows[:3]]
-    resistance_zones = [f"{level - zone_buffer:.2f}-{level + zone_buffer:.2f}" for level in recent_swing_highs[:3]]
-    demand_zones = []
-    supply_zones = []
-    for ob in (order_blocks or [])[:3]:
-        if ob['type'].startswith('BULLISH'):
-            demand_zones.append(f"{ob['price'] - zone_buffer:.2f}-{ob['price'] + zone_buffer:.2f}")
-        else:
-            supply_zones.append(f"{ob['price'] - zone_buffer:.2f}-{ob['price'] + zone_buffer:.2f}")
-    for fvg in (fvgs or [])[:2]:
-        if fvg['type'].startswith('BULLISH'):
-            demand_zones.append(f"{fvg['bottom']:.2f}-{fvg['top']:.2f}")
-        else:
-            supply_zones.append(f"{fvg['bottom']:.2f}-{fvg['top']:.2f}")
-    for sweep in (sweeps or [])[:2]:
-        if sweep['type'].startswith('BULLISH'):
-            demand_zones.append(f"{sweep['price'] - zone_buffer:.2f}-{sweep['price'] + zone_buffer:.2f}")
-        else:
-            supply_zones.append(f"{sweep['price'] - zone_buffer:.2f}-{sweep['price'] + zone_buffer:.2f}")
-    structure_markers = []
-    if bos:
-        structure_markers.append(bos)
-    if choch:
-        structure_markers.append(choch)
-    structure_markers = structure_markers[:2]
-    support_text = ', '.join(support_zones) if support_zones else 'none'
-    resistance_text = ', '.join(resistance_zones) if resistance_zones else 'none'
-    demand_text = ', '.join(demand_zones) if demand_zones else 'none'
-    supply_text = ', '.join(supply_zones) if supply_zones else 'none'
-    marker_text = ', '.join(structure_markers) if structure_markers else 'balanced'
-    return (
-        f"Market structure zones: support={support_text}; resistance={resistance_text}; "
-        f"demand={demand_text}; supply={supply_text}; structure markers={marker_text}; "
-        f"current price={current_price:.2f}. The AI must identify whether price is approaching a demand/supply or support/resistance zone, "
-        f"and whether the next move is a continuation or a reversal into the next clear invalidation zone."
-    )
-
-def compute_timeframe_structure(df, label):
-    """Bundle every structural read for one timeframe into a single dict. Used to build the
-    HTF (direction) and LTF (entry-timing) prompt blocks from a consistent, reusable source."""
-    if df is None or df.empty or len(df) < 5:
-        return None
-    try:
-        micro = calculate_microstructure(df)
-        bos, choch = detect_bos_choch(df)
-        return {
-            'label': label,
-            'micro': micro,
-            'bos': bos,
-            'choch': choch,
-            'order_blocks': detect_order_blocks(df),
-            'fvgs': detect_fvg(df),
-            'sweeps': detect_liquidity_sweeps(df),
-            'swings': find_swings(df),
-            'divergence': detect_rsi_divergence(df),
-            'rsi': compute_rsi_last(pd.to_numeric(df['Close'], errors='coerce')),
-            'atr': calculate_atr(df),
-            'close': float(df['Close'].iloc[-1]),
-            'candles': analyze_candle_structure(df),
-        }
-    except Exception:
-        return None
-
-def _fmt_zone_list(items, formatter, limit=2):
-    picked = (items or [])[-limit:]
-    return '; '.join(formatter(x) for x in picked) if picked else 'none'
-
-def build_htf_structure_block(h4_struct, h1_struct, h1_df, current_price, pair_config):
-    """THE authoritative directional-bias block. Built entirely from H4 (macro) and H1
-    (primary) structure — BOS/CHOCH, order blocks, FVGs, swings, RSI divergence, premium/
-    discount of the dealing range — so bias/market_state is decided on timeframes that
-    actually hold up, not on 10-minute noise."""
-    lines = []
-    for label, s in (('4H (macro)', h4_struct), ('1H (primary)', h1_struct)):
-        if not s:
-            lines.append(f"{label}: data unavailable.")
-            continue
-        m = s['micro']
-        markers = ', '.join(x for x in [s['bos'], s['choch']] if x) or 'no fresh BOS/CHOCH'
-        obs = _fmt_zone_list(s['order_blocks'], lambda ob: f"{ob['type']}@{ob['price']:.2f}({ob['strength']})")
-        fv = _fmt_zone_list(s['fvgs'], lambda f: f"{f['type']} {f['bottom']:.2f}-{f['top']:.2f}")
-        sw = _fmt_zone_list(s['sweeps'], lambda sp: f"{sp['type']}@{sp['price']:.2f}", limit=1)
-        div = f"{s['divergence']['type']} ({s['divergence']['reason']})" if s['divergence'] else 'none'
-        lines.append(
-            f"{label}: trend={m.get('momentum')} (price {m.get('price_vs_vwap')} VWAP, RVOL {m.get('rvol')}), "
-            f"structure={markers}, order blocks=[{obs}], FVGs=[{fv}], sweep=[{sw}], RSI {s['rsi']} div={div}, "
-            f"swing highs={s['swings']['recent_swing_highs']}, swing lows={s['swings']['recent_swing_lows']}."
-        )
-    pd_text = build_premium_discount_context(h1_df, current_price) if h1_df is not None and not h1_df.empty else 'Range position unavailable.'
-    lines.append(f"H1 dealing-range position: {pd_text}")
-    return ' '.join(lines)
-
-def build_ltf_entry_block(m30_struct, m15_struct, m10_struct, current_price, pair_config):
-    """LTF entry-timing block ONLY — never used to determine direction. M15 is the primary
-    entry timeframe (pullback structure the limit order anchors to); M30 cross-checks that the
-    M15 pullback zone isn't pure noise; M10 gives the finest-grained VWAP/RVOL/candle read for
-    whether a pullback is actually happening right now."""
-    lines = []
-    if m15_struct:
-        s = m15_struct
-        obs = _fmt_zone_list(s['order_blocks'], lambda ob: f"{ob['type']}@{ob['price']:.2f}({ob['strength']})")
-        fv = _fmt_zone_list(s['fvgs'], lambda f: f"{f['type']} {f['bottom']:.2f}-{f['top']:.2f}")
-        div = f"{s['divergence']['type']}" if s['divergence'] else 'none'
-        atr_txt = f"{s['atr']:.5f}" if s.get('atr') else 'n/a'
-        lines.append(
-            f"15M (primary entry TF): order blocks=[{obs}], FVGs=[{fv}], swing highs={s['swings']['recent_swing_highs']}, "
-            f"swing lows={s['swings']['recent_swing_lows']}, RSI {s['rsi']} div={div}, ATR {atr_txt}."
-        )
-    else:
-        lines.append("15M: data unavailable.")
-    if m30_struct:
-        s = m30_struct
-        markers = ', '.join(x for x in [s['bos'], s['choch']] if x) or 'balanced'
-        lines.append(f"30M (confirmation): structure={markers}, momentum={s['micro'].get('momentum')}, price vs VWAP={s['micro'].get('price_vs_vwap')}.")
-    else:
-        lines.append("30M: data unavailable.")
-    if m10_struct:
-        s = m10_struct
-        recent_candle = s['candles'][-1] if s.get('candles') else None
-        candle_txt = f", last candle {recent_candle['pattern']} ({recent_candle['candle_type']})" if recent_candle else ""
-        lines.append(f"10M (timing): momentum={s['micro'].get('momentum')}, price vs VWAP={s['micro'].get('price_vs_vwap')}, RVOL={s['micro'].get('rvol')}{candle_txt}.")
-    else:
-        lines.append("10M: data unavailable.")
-    return ' '.join(lines)
-
-def build_multitimeframe_context(all_data, symbol):
-    if not all_data or not symbol:
-        return 'Multi-timeframe context unavailable.'
-    data = all_data.get(symbol, {})
-    if not isinstance(data, dict):
-        return 'Multi-timeframe context unavailable.'
-    frames = [('10M', data.get('M10')), ('15M', data.get('M15')), ('30M', data.get('M30')), ('1H', data.get('H1')), ('4H', data.get('H4'))]
-    parts = []
-    for label, frame in frames:
-        if frame is None or getattr(frame, 'empty', True):
-            continue
-        micro = calculate_microstructure(frame)
-        if not micro:
-            micro = {'price_vs_vwap': 'NEUTRAL', 'momentum': 'NEUTRAL', 'rvol': 1.0}
-        bos, choch = detect_bos_choch(frame)
-        order_blocks = detect_order_blocks(frame)
-        fvgs = detect_fvg(frame)
-        sweeps = detect_liquidity_sweeps(frame)
-        divergence = detect_rsi_divergence(frame)
-        structure_bits = []
-        if bos:
-            structure_bits.append(bos)
-        if choch:
-            structure_bits.append(choch)
-        if order_blocks:
-            structure_bits.append(f"OB:{order_blocks[-1]['type']}")
-        if fvgs:
-            structure_bits.append(f"FVG:{fvgs[-1]['type']}")
-        if sweeps:
-            structure_bits.append(f"SWP:{sweeps[-1]['type']}")
-        if divergence:
-            structure_bits.append(divergence['type'])
-        structure_text = ', '.join(structure_bits) if structure_bits else 'balanced structure'
-        parts.append(f"{label}: price is {micro['price_vs_vwap']} VWAP, momentum is {micro['momentum']}, RVOL is {micro['rvol']:.2f}, and the current read is {structure_text}.")
-    if not parts:
-        return 'No usable higher-timeframe or lower-timeframe context is available.'
-    return ' '.join(parts)
-
-def detect_directional_confluence(df, swings=None, htf_context=None, dxy_context=None, symbol=None):
-    if df is None or df.empty:
-        return {'direction': None, 'bullish_evidence': [], 'bearish_evidence': [], 'bull_count': 0, 'bear_count': 0}
-    bullish_evidence = []
-    bearish_evidence = []
-    micro = calculate_microstructure(df)
-    reversal = detect_reversal(df)
-    continuation = detect_continuation(df)
-    sweeps = detect_liquidity_sweeps(df)
-    divergence = detect_rsi_divergence(df)
-    if reversal:
-        if reversal.get('direction') == 'BUY':
-            bullish_evidence.append(f"reversal candle rejecting lows ({reversal['type']})")
-        else:
-            bearish_evidence.append(f"reversal candle rejecting highs ({reversal['type']})")
-    if continuation:
-        if continuation.get('direction') == 'BUY':
-            bullish_evidence.append(f"continuation break to the upside ({continuation['type']})")
-        else:
-            bearish_evidence.append(f"continuation break to the downside ({continuation['type']})")
-    for sweep in sweeps[-2:]:
-        if sweep['type'] == 'BULLISH_SWEEP':
-            bullish_evidence.append('liquidity sweep of lows reclaimed')
-        else:
-            bearish_evidence.append('liquidity sweep of highs rejected')
-    if divergence:
-        if divergence['type'] == 'BULLISH_DIV':
-            bullish_evidence.append('bullish RSI divergence')
-        else:
-            bearish_evidence.append('bearish RSI divergence')
-    if micro.get('momentum') == 'BULLISH' and micro.get('price_vs_vwap') == 'ABOVE':
-        bullish_evidence.append('price holding above VWAP with bullish momentum')
-    elif micro.get('momentum') == 'BEARISH' and micro.get('price_vs_vwap') == 'BELOW':
-        bearish_evidence.append('price holding below VWAP with bearish momentum')
-    pos_info = range_position(df, df['Close'].iloc[-1])
-    if pos_info:
-        pos, lo, hi = pos_info
-        if pos <= 0.35:
-            bullish_evidence.append('price in discount zone of the recent range (favors longs)')
-        elif pos >= 0.65:
-            bearish_evidence.append('price in premium zone of the recent range (favors shorts)')
-    if isinstance(htf_context, dict):
-        htf_trend = str(htf_context.get('trend') or htf_context.get('bias') or '').upper()
-        if htf_trend == 'BULLISH':
-            bullish_evidence.append('higher-timeframe trend bullish')
-        elif htf_trend == 'BEARISH':
-            bearish_evidence.append('higher-timeframe trend bearish')
-    if dxy_context and symbol in ['XAUUSD', 'EURUSD', 'BTCUSD']:
-        trend = dxy_context.get('trend')
-        pos = dxy_context.get('price_vs_vwap')
-        if trend == 'BEARISH' and pos == 'BELOW':
-            bullish_evidence.append('DXY weakness supporting longs')
-        elif trend == 'BULLISH' and pos == 'ABOVE':
-            bearish_evidence.append('DXY strength supporting shorts')
-    bull = len(bullish_evidence)
-    bear = len(bearish_evidence)
-    direction = None
-    if bull >= 2 and bull > bear:
-        direction = 'BUY'
-    elif bear >= 2 and bear > bull:
-        direction = 'SELL'
-    return {'direction': direction, 'bullish_evidence': bullish_evidence, 'bearish_evidence': bearish_evidence, 'bull_count': bull, 'bear_count': bear}
-
-def build_mtf_picture(all_data, symbol):
-    data = all_data.get(symbol, {}) or {}
-    specs = [('M10', 1.0), ('M15', 1.0), ('M30', 1.5), ('H1', 2.0), ('H4', 3.0)]
-    snaps = []
-    for label, weight in specs:
-        df = data.get(label)
-        if df is None or getattr(df, 'empty', True):
-            continue
-        micro = calculate_microstructure(df)
-        bos, choch = detect_bos_choch(df)
-        sweeps = detect_liquidity_sweeps(df)
-        divergence = detect_rsi_divergence(df)
-        reversal = detect_reversal(df)
-        continuation = detect_continuation(df)
-        snaps.append({
-            'label': label,
-            'weight': weight,
-            'micro': micro,
-            'bos': bos,
-            'choch': choch,
-            'sweeps': sweeps,
-            'divergence': divergence,
-            'reversal': reversal,
-            'continuation': continuation
-        })
-    score = 0.0
-    bull_items, bear_items = [], []
-    for s in snaps:
-        w = s['weight']
-        m = s['micro']
-        if m.get('momentum') == 'BULLISH' and m.get('price_vs_vwap') == 'ABOVE':
-            score += w
-            bull_items.append(f"{s['label']} trend bullish (above VWAP)")
-        elif m.get('momentum') == 'BEARISH' and m.get('price_vs_vwap') == 'BELOW':
-            score -= w
-            bear_items.append(f"{s['label']} trend bearish (below VWAP)")
-        if s['bos'] == 'BULLISH_BOS' or s['choch'] == 'BULLISH_CHOCH':
-            score += w
-            bull_items.append(f"{s['label']} {s['bos'] or s['choch']}")
-        elif s['bos'] == 'BEARISH_BOS' or s['choch'] == 'BEARISH_CHOCH':
-            score -= w
-            bear_items.append(f"{s['label']} {s['bos'] or s['choch']}")
-        for sw in s['sweeps'][-1:]:
-            if sw['type'] == 'BULLISH_SWEEP':
-                score += 0.5 * w
-                bull_items.append(f"{s['label']} swept lows reclaimed")
-            else:
-                score -= 0.5 * w
-                bear_items.append(f"{s['label']} swept highs rejected")
-        if s['divergence']:
-            if s['divergence']['type'] == 'BULLISH_DIV':
-                score += 0.5 * w
-                bull_items.append(f"{s['label']} bullish RSI divergence")
-            else:
-                score -= 0.5 * w
-                bear_items.append(f"{s['label']} bearish RSI divergence")
-        if s['reversal']:
-            if s['reversal']['direction'] == 'BUY':
-                score += w
-                bull_items.append(f"{s['label']} reversal candle rejecting lows")
-            else:
-                score -= w
-                bear_items.append(f"{s['label']} reversal candle rejecting highs")
-        if s['continuation']:
-            if s['continuation']['direction'] == 'BUY':
-                score += w
-                bull_items.append(f"{s['label']} continuation break upside")
-            else:
-                score -= w
-                bear_items.append(f"{s['label']} continuation break downside")
-    htf_reads = []
-    for s in snaps:
-        if s['label'] in ('H1', 'H4'):
-            m = s['micro']
-            if m.get('momentum') == 'BULLISH' and m.get('price_vs_vwap') == 'ABOVE':
-                htf_reads.append('BULLISH')
-            elif m.get('momentum') == 'BEARISH' and m.get('price_vs_vwap') == 'BELOW':
-                htf_reads.append('BEARISH')
-            else:
-                htf_reads.append('NEUTRAL')
-    htf_bias = 'BULLISH' if htf_reads and all(r == 'BULLISH' for r in htf_reads) else ('BEARISH' if htf_reads and all(r == 'BEARISH' for r in htf_reads) else 'NEUTRAL')
-    return {
-        'snaps': snaps,
-        'score': score,
-        'bull_items': bull_items,
-        'bear_items': bear_items,
-        'htf_bias': htf_bias
-    }
-
-BIAS_MIN_HOLD_MINUTES = 45
-
-def resolve_firm_direction(symbol, picture):
-    score = picture.get('score', 0)
-    htf = picture.get('htf_bias', 'NEUTRAL')
-    notes = []
-    base = 'BUY' if score >= 2.0 else ('SELL' if score <= -2.0 else None)
-    if base and htf != 'NEUTRAL' and base != htf:
-        if abs(score) >= 6.0:
-            notes.append(f"lower-timeframe evidence is overwhelming ({score:+.1f}), overriding the {htf} HTF bias")
-        else:
-            base = htf
-            notes.append(f"HTF bias {htf} overrides conflicting lower-timeframe noise")
-    firm = base if base else (htf if htf != 'NEUTRAL' and abs(score) >= 2.0 else None)
-    now = datetime.now()
-    stored = st.session_state.directional_bias.get(symbol)
-    if stored and (now - stored['since']).total_seconds() < BIAS_MIN_HOLD_MINUTES * 60:
-        standing = stored['direction']
-        if firm and firm != standing:
-            counter = picture['bull_items'] if firm == 'BUY' else picture['bear_items']
-            has_htf_break = any(('H1' in it or 'H4' in it) and ('BOS' in it or 'CHOCH' in it) for it in counter)
-            if has_htf_break and abs(score) >= 6.0:
-                notes.append(f"standing {standing} bias overridden by an H1/H4 structural break with strong evidence ({score:+.1f})")
-            elif abs(score) >= 4.0:
-                firm = None
-                notes.append(f"tape contradicts the standing {standing} bias but lacks an H1/H4 structural break - standing aside (WAIT) instead of flipping")
-            else:
-                firm = standing
-                notes.append(f"maintaining the standing {standing} bias set at {stored['since'].strftime('%H:%M')} - insufficient proof to flip")
-        elif firm is None and abs(score) < 4.0:
-            firm = standing
-            notes.append(f"tape is quiet - maintaining the standing {standing} bias set at {stored['since'].strftime('%H:%M')}")
-        elif firm is None:
-            notes.append(f"tape strongly contradicts the standing {standing} bias - standing aside (WAIT) until structure resolves")
-    if firm:
-        if not stored or stored['direction'] != firm:
-            st.session_state.directional_bias[symbol] = {'direction': firm, 'since': now}
-    elif stored and (now - stored['since']).total_seconds() >= BIAS_MIN_HOLD_MINUTES * 60:
-        st.session_state.directional_bias.pop(symbol, None)
-    return firm, notes
-
-def get_pair_config(symbol):
-    # NOTE ON THE LIMIT ZONE: 'min_entry_gap_pct'/'min_entry_gap_atr' set a FLOOR on how far
-    # the entry must sit from live price (so a signal can never be a disguised market order),
-    # while 'max_entry_gap_pct'/'max_entry_points'/'limit_zone_atr' set the CEILING (so the
-    # limit stays realistic and likely to be tagged rather than sitting in no-man's land).
-    # The old ceiling values here were tight enough (0.20-0.30% / ~0.9 ATR) that any genuine
-    # structural pullback (an order block, FVG or swing level a reasonable distance away) got
-    # rejected and silently replaced with a market-price entry. Both bounds are now wider and
-    # symbol-appropriate, and a floor was added that did not exist before.
-    base = {
-        'digits': 2,
-        'tick_size': 0.01,
-        'min_dist_pct': 0.0015,
-        'max_risk_pct': 0.008,
-        'min_rr': 1.3,
-        'target_rr': 2.0,
-        'max_rr': 3.0,
-        'score_floor': MINIMUM_CONFLUENCE_SCORE,
-        'candidate_score': MINIMUM_CONFLUENCE_SCORE,
-        'cooldown_minutes': 30,
-        'min_entry_gap_pct': 0.0009,
-        'min_entry_gap_atr': 0.12,
-        'max_entry_gap_pct': 0.0085,
-        'max_entry_points': 35,
-        'min_stop_atr': 1.0,
-        'max_stop_atr': 3.0,
-        'stop_buffer_atr': 0.25,
-        'tp_buffer_atr': 0.12,
-        'limit_zone_atr': 2.2,
-        'default_pullback_atr': 0.55,
-        'spread_multiplier': 1.5,
-    }
-    overrides = {
-        'XAUUSD': {
-            'digits': 2,
-            'tick_size': 0.01,
-            'min_dist_pct': 0.0028,
-            'max_risk_pct': 0.010,
-            'min_entry_gap_pct': 0.0012,
-            'min_entry_gap_atr': 0.12,
-            'max_entry_gap_pct': 0.009,
-            'max_entry_points': 35,
-            'min_stop_atr': 1.2,
-            'target_rr': 2.0,
-            'max_rr': 3.0,
-            'limit_zone_atr': 2.2,
-            'default_pullback_atr': 0.55,
-        },
-        'EURUSD': {
-            'digits': 5,
-            'tick_size': 0.00001,
-            'min_dist_pct': 0.0012,
-            'max_risk_pct': 0.004,
-            'min_entry_gap_pct': 0.0007,
-            'min_entry_gap_atr': 0.12,
-            'max_entry_gap_pct': 0.006,
-            'max_entry_points': 0.0075,
-            'min_stop_atr': 1.0,
-            'target_rr': 2.0,
-            'max_rr': 3.0,
-            'max_stop_atr': 2.5,
-            'limit_zone_atr': 2.2,
-            'default_pullback_atr': 0.55,
-        },
-        'BTCUSD': {
-            'digits': 2,
-            'tick_size': 0.01,
-            'min_dist_pct': 0.006,
-            'max_risk_pct': 0.015,
-            'min_entry_gap_pct': 0.0025,
-            'min_entry_gap_atr': 0.12,
-            'max_entry_gap_pct': 0.014,
-            'max_entry_points': 450,
-            'min_stop_atr': 1.2,
-            'target_rr': 2.0,
-            'max_rr': 3.0,
-            'max_stop_atr': 3.5,
-            'limit_zone_atr': 2.2,
-            'default_pullback_atr': 0.55,
-        },
-        'US30': {
-            'digits': 1,
-            'tick_size': 0.1,
-            'min_dist_pct': 0.004,
-            'max_risk_pct': 0.010,
-            'min_entry_gap_pct': 0.0015,
-            'min_entry_gap_atr': 0.12,
-            'max_entry_gap_pct': 0.009,
-            'max_entry_points': 350,
-            'min_stop_atr': 1.0,
-            'target_rr': 2.0,
-            'max_rr': 3.0,
-            'limit_zone_atr': 2.2,
-            'default_pullback_atr': 0.55,
-        },
-    }
-    return {**base, **overrides.get(symbol, {})}
-
-def calculate_structural_score(df, symbol, dxy_context=None, phase_context=None):
-    if df.empty or len(df) < 10:
-        return {'structural_score': 0, 'score_reason': 'Insufficient data', 'candidate_direction': None, 'market_phase': 'coiling', 'phase_reason': 'Not enough data to assess structure.'}
-    micro = calculate_microstructure(df)
-    bos, choch = detect_bos_choch(df)
-    order_blocks = detect_order_blocks(df)
-    fvgs = detect_fvg(df)
-    sweeps = detect_liquidity_sweeps(df)
-    phase_context = phase_context or detect_market_phase(df)
-    score = 42
-    reasons = []
-    if micro.get('price_vs_vwap') == 'ABOVE':
-        score += 8
-        reasons.append('price holding above VWAP')
-    else:
-        score += 4
-        reasons.append('price trading near VWAP')
-    if micro.get('momentum') == 'BULLISH':
-        score += 6
-        reasons.append('short-term momentum bullish')
-    else:
-        score += 4
-        reasons.append('short-term momentum bearish')
-    if micro.get('rvol', 0) > 2.0:
-        score += 10
-        reasons.append('strong institutional volume')
-    elif micro.get('rvol', 0) < 0.5:
-        score -= 8
-        reasons.append('low volume / exhaustion risk')
-    if bos == 'BULLISH_BOS' or choch == 'BULLISH_CHOCH':
-        score += 10
-        reasons.append('bullish BOS/CHOCH')
-    elif bos == 'BEARISH_BOS' or choch == 'BEARISH_CHOCH':
-        score += 10
-        reasons.append('bearish BOS/CHOCH')
-    if order_blocks:
-        score += 6
-        reasons.append('order block present')
-    if fvgs:
-        score += 6
-        reasons.append('fair value gap present')
-    if sweeps:
-        score += 6
-        reasons.append('liquidity sweep detected')
-    phase = phase_context.get('phase')
-    if phase == 'continuation':
-        score += 8
-        reasons.append('continuation structure is present')
-    elif phase == 'reversal':
-        score += 6
-        reasons.append('reversal structure is forming')
-    elif phase == 'exhaustion':
-        score -= 5
-        reasons.append('exhaustion is present and needs caution')
-    entry_quality = phase_context.get('entry_quality')
-    if entry_quality == 'early':
-        score += 5
-        reasons.append('entry zone is still early and actionable')
-    elif entry_quality == 'late':
-        score -= 4
-        reasons.append('entry zone is late and may be chasing price')
-    if dxy_context and symbol in ['XAUUSD', 'EURUSD', 'BTCUSD']:
-        if dxy_context['trend'] == 'BULLISH' and dxy_context['price_vs_vwap'] == 'ABOVE':
-            score -= 6
-            reasons.append('DXY is suppressing the setup')
-        elif dxy_context['trend'] == 'BEARISH' and dxy_context['price_vs_vwap'] == 'BELOW':
-            score += 6
-            reasons.append('DXY is supporting the setup')
-    score = max(0, min(100, int(score)))
-    phase_dir = phase_context.get('direction')
-    candidate_direction = None
-    if phase_dir and score >= 70:
-        candidate_direction = phase_dir
-    elif score >= 75 and micro.get('momentum') == 'BULLISH':
-        candidate_direction = 'BUY'
-    elif score >= 75 and micro.get('momentum') == 'BEARISH':
-        candidate_direction = 'SELL'
-    return {
-        'structural_score': score,
-        'score_reason': '; '.join(reasons[-4:]),
-        'candidate_direction': candidate_direction,
-        'market_phase': phase,
-        'phase_reason': phase_context.get('reason', 'Structure is being assessed.'),
-        'entry_quality': entry_quality,
-        'entry_zone': phase_context.get('entry_zone')
-    }
-
-def analyze_candle_structure(df):
-    if len(df) < 3:
-        return []
-    analysis = []
-    for i in range(max(0, len(df)-10), len(df)):
-        candle = df.iloc[i]
-        body = abs(candle['Close'] - candle['Open'])
-        total_range = candle['High'] - candle['Low']
-        if total_range == 0:
-            continue
-        upper_wick = candle['High'] - max(candle['Open'], candle['Close'])
-        lower_wick = min(candle['Open'], candle['Close']) - candle['Low']
-        body_ratio = body / total_range
-        upper_wick_ratio = upper_wick / total_range
-        lower_wick_ratio = lower_wick / total_range
-        candle_type = "BULLISH" if candle['Close'] > candle['Open'] else "BEARISH"
-        pattern = "NORMAL"
-        if body_ratio > 0.7:
-            pattern = "STRONG_" + candle_type
-        elif body_ratio < 0.3:
-            pattern = "DOJI"
-        elif upper_wick_ratio > 0.6:
-            pattern = "REJECTION_HIGH"
-        elif lower_wick_ratio > 0.6:
-            pattern = "REJECTION_LOW"
-        elif upper_wick_ratio > 0.4 and body_ratio < 0.4:
-            pattern = "SHOOTING_STAR" if candle_type == "BEARISH" else "HANGING_MAN"
-        elif lower_wick_ratio > 0.4 and body_ratio < 0.4:
-            pattern = "HAMMER" if candle_type == "BULLISH" else "INVERTED_HAMMER"
-        analysis.append({
-            'time': df.index[i],
-            'candle_type': candle_type,
-            'pattern': pattern,
-            'body_ratio': body_ratio,
-            'upper_wick_ratio': upper_wick_ratio,
-            'lower_wick_ratio': lower_wick_ratio,
-            'price': candle['Close'],
-            'volume': candle['Volume']
-        })
-    return analysis[-5:]
-
-def build_setup_context(df, swings, current_price, symbol, dxy_context=None):
-    micro = calculate_microstructure(df)
-    phase_context = detect_market_phase(df, swings=swings)
-    continuation = detect_continuation(df)
-    reversal = detect_reversal(df)
-    exhaustion = detect_exhaustion(df)
-    atr = calculate_atr(df)
-    if continuation:
-        setup_type = 'continuation'
-        setup_bias = continuation.get('direction') or ('BUY' if micro.get('momentum') == 'BULLISH' else 'SELL')
-    elif reversal:
-        setup_type = 'reversal'
-        setup_bias = reversal.get('direction') or ('BUY' if micro.get('momentum') == 'BULLISH' else 'SELL')
-    elif exhaustion:
-        setup_type = 'exhaustion'
-        setup_bias = 'WAIT'
-    else:
-        setup_type = 'coiling'
-        setup_bias = 'WAIT'
-    entry_quality = phase_context.get('entry_quality', 'unknown')
-    timing_state = 'ready' if entry_quality == 'early' else 'watch' if entry_quality == 'acceptable' else 'late'
-    if setup_type == 'exhaustion' or entry_quality == 'late':
-        timing_state = 'late'
-    return {
-        'setup_type': setup_type,
-        'setup_bias': setup_bias,
-        'phase': phase_context.get('phase', 'coiling'),
-        'phase_reason': phase_context.get('reason', 'Structure is forming.'),
-        'entry_quality': entry_quality,
-        'entry_timing': timing_state,
-        'atr': atr,
-        'micro': micro
-    }
 
 def _adx_value(df, period=14):
     try:
@@ -1386,372 +383,6 @@ def classify_market_regime(df, adx_trend=25, adx_range=18):
         return {"regime": "TRANSITIONAL", "adx": round(adx, 1), "trend_direction": mom, "tradable": True}
     return {"regime": "RANGING", "adx": round(adx, 1), "trend_direction": None, "tradable": False}
 
-def strategy_htf_trend(symbol, all_data):
-    data = all_data.get(symbol, {}) or {}
-    votes = []
-    for key in ("H1", "H4"):
-        df = data.get(key)
-        if df is None or getattr(df, "empty", True):
-            continue
-        m = calculate_microstructure(df) or {}
-        if m.get("momentum") == "BULLISH" and m.get("price_vs_vwap") == "ABOVE":
-            votes.append("BUY")
-        elif m.get("momentum") == "BEARISH" and m.get("price_vs_vwap") == "BELOW":
-            votes.append("SELL")
-    if not votes:
-        return None
-    if all(v == "BUY" for v in votes):
-        return "BUY"
-    if all(v == "SELL" for v in votes):
-        return "SELL"
-    return None
-
-def strategy_zone_reversion(m10, current_price, swings, order_blocks, fvgs):
-    try:
-        atr = calculate_atr(m10) or (float(current_price) * 0.002)
-        near = float(atr) * 0.6
-        demand, supply = [], []
-        for ob in (order_blocks or []):
-            p = float(ob.get("price", 0) or 0)
-            if ob.get("type") == "BULLISH_OB" and p <= current_price:
-                demand.append(p)
-            if ob.get("type") == "BEARISH_OB" and p >= current_price:
-                supply.append(p)
-        for fvg in (fvgs or []):
-            if fvg.get("type") == "BULLISH_FVG" and float(fvg.get("bottom", 0)) <= current_price:
-                demand.append(float(fvg.get("bottom")))
-            if fvg.get("type") == "BEARISH_FVG" and float(fvg.get("top", 0)) >= current_price:
-                supply.append(float(fvg.get("top")))
-        for sl in (swings or {}).get("recent_swing_lows", []):
-            if float(sl) <= current_price:
-                demand.append(float(sl))
-        for sh in (swings or {}).get("recent_swing_highs", []):
-            if float(sh) >= current_price:
-                supply.append(float(sh))
-        near_demand = bool(demand) and (current_price - max(demand)) <= near
-        near_supply = bool(supply) and (min(supply) - current_price) <= near
-        if near_demand and not near_supply:
-            return "BUY"
-        if near_supply and not near_demand:
-            return "SELL"
-    except Exception:
-        pass
-    return None
-
-def strategy_momentum_breakout(m10):
-    micro = calculate_microstructure(m10) or {}
-    bos, choch = detect_bos_choch(m10)
-    if micro.get("rvol", 0) >= 1.5:
-        if bos == "BULLISH_BOS" or choch == "BULLISH_CHOCH":
-            return "BUY"
-        if bos == "BEARISH_BOS" or choch == "BEARISH_CHOCH":
-            return "SELL"
-    return None
-
-def strategy_liquidity_rejection(m10):
-    rev = detect_reversal(m10)
-    if rev and rev.get("direction") == "BUY":
-        return "BUY"
-    if rev and rev.get("direction") == "SELL":
-        return "SELL"
-    sweeps = detect_liquidity_sweeps(m10)
-    if sweeps:
-        s = sweeps[-1]
-        if s.get("type") == "BULLISH_SWEEP":
-            return "BUY"
-        if s.get("type") == "BEARISH_SWEEP":
-            return "SELL"
-    return None
-
-def multi_strategy_vote(symbol, all_data, m10, current_price, swings, order_blocks, fvgs):
-    votes = {
-        "htf_trend": strategy_htf_trend(symbol, all_data),
-        "zone_reversion": strategy_zone_reversion(m10, current_price, swings, order_blocks, fvgs),
-        "momentum_breakout": strategy_momentum_breakout(m10),
-        "liquidity_rejection": strategy_liquidity_rejection(m10),
-    }
-    buy = [k for k, v in votes.items() if v == "BUY"]
-    sell = [k for k, v in votes.items() if v == "SELL"]
-    direction = None
-    if len(buy) >= 2 and (len(buy) - len(sell)) >= 2:
-        direction = "BUY"
-    elif len(sell) >= 2 and (len(sell) - len(buy)) >= 2:
-        direction = "SELL"
-    return {"direction": direction, "votes": votes, "buy_strategies": buy, "sell_strategies": sell}
-
-def htf_direction_gate(symbol, all_data):
-    return strategy_htf_trend(symbol, all_data)
-
-def _desk_position_lock(symbol, proposed, current_price):
-    try:
-        active = st.session_state.active_signals.get(symbol)
-        if not active:
-            return None
-        prior_dir = active.get("direction")
-        prior_entry = float(active.get("entry") or 0)
-        ts = active.get("timestamp")
-        if prior_dir == proposed or prior_entry <= 0:
-            return None
-        age_min = (datetime.now() - ts).total_seconds() / 60.0 if ts else 999
-        risk_est = abs(prior_entry) * 0.004
-        if prior_dir == "BUY" and proposed == "SELL":
-            if current_price is not None and current_price <= prior_entry - risk_est:
-                return None
-            if age_min < 90:
-                return "A BUY from {:.2f} is still live and its invalidation has not been taken out. Blocking a premature SELL to prevent whipsaw.".format(prior_entry)
-        if prior_dir == "SELL" and proposed == "BUY":
-            if current_price is not None and current_price >= prior_entry + risk_est:
-                return None
-            if age_min < 90:
-                return "A SELL from {:.2f} is still live and its invalidation has not been taken out. Blocking a premature BUY to prevent whipsaw.".format(prior_entry)
-        return None
-    except Exception:
-        return None
-
-def build_candidate_levels(symbol, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
-                            htf_swings, htf_order_blocks, htf_fvgs, atr_htf, pair_config,
-                            vwap=None, htf_df=None):
-    """Build genuine LIMIT-order candidate plans the AI can choose from or refine. Entry price
-    comes from LTF (M15/M30) pullback structure — an order block, FVG, swing or VWAP a
-    realistic distance from live price. SL/TP come from HTF (H1/H4) structure and HTF ATR, so
-    risk is sized to the timeframe the trade thesis is actually based on, not to LTF noise."""
-    plans = []
-    try:
-        current_price = float(current_price)
-    except Exception:
-        return plans
-    for signal in ('BUY', 'SELL'):
-        candidate_entry = compute_default_limit_entry(signal, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf, pair_config, vwap=vwap)
-        if not candidate_entry:
-            continue
-        plan = build_structural_plan_v2(
-            signal=signal,
-            entry=candidate_entry,
-            current_price=current_price,
-            swings=htf_swings,
-            order_blocks=htf_order_blocks,
-            fvgs=htf_fvgs,
-            atr=atr_htf,
-            pair_config=pair_config,
-            market_df=htf_df
-        )
-        if plan:
-            plan['plan'] = 'LIMIT'
-            plan['signal'] = signal
-            plans.append(plan)
-    return plans
-
-def build_exhaustion_target(signal, entry, df, swings, order_blocks, fvgs, atr, pair_config):
-    try:
-        entry = float(entry)
-        atr = float(atr or entry * float(pair_config.get('min_dist_pct', 0.0015)))
-    except Exception:
-        return None
-    candidates = []
-    if df is not None and not df.empty:
-        look = df.tail(60)
-        if signal == 'BUY':
-            candidates.append(float(look['High'].max()))
-        else:
-            candidates.append(float(look['Low'].min()))
-    highs = [float(x) for x in (swings or {}).get('recent_swing_highs', []) if x]
-    lows = [float(x) for x in (swings or {}).get('recent_swing_lows', []) if x]
-    if signal == 'BUY':
-        candidates.extend(x for x in highs if x > entry)
-        candidates.extend(float(ob.get('price')) for ob in (order_blocks or [])
-                          if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > entry)
-        candidates.extend(float(fvg.get('top')) for fvg in (fvgs or [])
-                          if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > entry)
-        candidates = [x for x in candidates if x > entry + atr * 0.35]
-        return min(candidates) if candidates else entry + atr * float(pair_config.get('target_rr', 2.0))
-    candidates.extend(x for x in lows if x < entry)
-    candidates.extend(float(ob.get('price')) for ob in (order_blocks or [])
-                      if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < entry)
-    candidates.extend(float(fvg.get('bottom')) for fvg in (fvgs or [])
-                      if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < entry)
-    candidates = [x for x in candidates if x < entry - atr * 0.35]
-    return max(candidates) if candidates else entry - atr * float(pair_config.get('target_rr', 2.0))
-
-def build_structural_plan_v2(signal, entry, current_price, swings, order_blocks, fvgs, atr, pair_config, market_df=None):
-    try:
-        entry = float(entry)
-        current_price = float(current_price)
-    except Exception:
-        return None
-    if signal not in ('BUY', 'SELL'):
-        return None
-    tick = float(pair_config.get('tick_size', 0.01) or 0.01)
-    if atr is None or float(atr) <= 0:
-        atr = abs(entry) * float(pair_config.get('min_dist_pct', 0.0015))
-        atr = float(atr)
-    stop_buffer = max(
-        atr * float(pair_config.get('stop_buffer_atr', 0.25)),
-        tick * 3.0
-    )
-    tp_buffer = max(
-        atr * float(pair_config.get('tp_buffer_atr', 0.12)),
-        tick * 2.0
-    )
-    min_stop_distance = max(
-        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        atr * float(pair_config.get('min_stop_atr', 1.0))
-    )
-    max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
-    max_stop_distance = min(max_stop_price, atr * float(pair_config.get('max_stop_atr', 3.0)))
-    sl_anchor, tp_anchor = get_structural_anchors(signal, entry, swings, order_blocks, fvgs)
-    exhaustion_target = build_exhaustion_target(signal, entry, market_df, swings, order_blocks, fvgs, atr, pair_config)
-    target_rr = float(pair_config.get('target_rr', 2.0))
-    min_rr = float(pair_config.get('min_rr', 1.3))
-    max_rr = float(pair_config.get('max_rr', 3.0))
-    if signal == 'BUY':
-        if sl_anchor is not None:
-            sl = sl_anchor - stop_buffer
-        else:
-            sl = entry - min_stop_distance
-        risk = entry - sl
-        if risk < min_stop_distance:
-            sl = entry - min_stop_distance
-            risk = min_stop_distance
-        if risk > max_stop_distance:
-            sl = entry - max_stop_distance
-            risk = max_stop_distance
-        if risk <= 0:
-            return None
-        structure_target = exhaustion_target - tp_buffer if exhaustion_target is not None else None
-        tp = None
-        if structure_target is not None and structure_target > entry:
-            srr = (structure_target - entry) / risk
-            if srr >= min_rr:
-                tp = min(structure_target, entry + risk * max_rr)
-        if tp is None:
-            tp = min(entry + risk * target_rr, entry + risk * max_rr)
-        if (tp - entry) / risk < min_rr:
-            tp = entry + risk * min_rr
-        order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
-        rr = round((tp - entry) / risk, 2) if risk > 0 else 0
-        return {
-            'entry': round_price(entry, pair_config),
-            'stop_loss': round_price(sl, pair_config),
-            'take_profit': [round_price(tp, pair_config)],
-            'exhaustion_target': round_price(tp, pair_config),
-            'rr_ratio': rr,
-            'risk_band': round_price(risk, pair_config),
-            'order_type': order_type,
-            'levels_source': 'PYTHON',
-        }
-    if signal == 'SELL':
-        if sl_anchor is not None:
-            sl = sl_anchor + stop_buffer
-        else:
-            sl = entry + min_stop_distance
-        risk = sl - entry
-        if risk < min_stop_distance:
-            sl = entry + min_stop_distance
-            risk = min_stop_distance
-        if risk > max_stop_distance:
-            sl = entry + max_stop_distance
-            risk = max_stop_distance
-        if risk <= 0:
-            return None
-        structure_target = exhaustion_target + tp_buffer if exhaustion_target is not None else None
-        tp = None
-        if structure_target is not None and structure_target < entry:
-            srr = (entry - structure_target) / risk
-            if srr >= min_rr:
-                tp = max(structure_target, entry - risk * max_rr)
-        if tp is None:
-            tp = max(entry - risk * target_rr, entry - risk * max_rr)
-        if (entry - tp) / risk < min_rr:
-            tp = entry - risk * min_rr
-        order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
-        rr = round((entry - tp) / risk, 2) if risk > 0 else 0
-        return {
-            'entry': round_price(entry, pair_config),
-            'stop_loss': round_price(sl, pair_config),
-            'take_profit': [round_price(tp, pair_config)],
-            'exhaustion_target': round_price(tp, pair_config),
-            'rr_ratio': rr,
-            'risk_band': round_price(risk, pair_config),
-            'order_type': order_type,
-            'levels_source': 'PYTHON',
-        }
-    return None
-
-def get_structural_anchors(signal, entry, swings, order_blocks, fvgs):
-    try:
-        entry = float(entry)
-    except Exception:
-        return None, None
-    swing_highs = []
-    swing_lows = []
-    try:
-        swing_highs = [float(x) for x in (swings or {}).get('recent_swing_highs', []) if x]
-        swing_lows = [float(x) for x in (swings or {}).get('recent_swing_lows', []) if x]
-    except Exception:
-        pass
-    order_blocks = order_blocks or []
-    fvgs = fvgs or []
-    try:
-        if signal == 'BUY':
-            sl_candidates = []
-            sl_candidates.extend([x for x in swing_lows if x < entry])
-            sl_candidates.extend([
-                float(ob.get('price'))
-                for ob in order_blocks
-                if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < entry
-            ])
-            sl_candidates.extend([
-                float(fvg.get('bottom'))
-                for fvg in fvgs
-                if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < entry
-            ])
-            tp_candidates = []
-            tp_candidates.extend([x for x in swing_highs if x > entry])
-            tp_candidates.extend([
-                float(ob.get('price'))
-                for ob in order_blocks
-                if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > entry
-            ])
-            tp_candidates.extend([
-                float(fvg.get('top'))
-                for fvg in fvgs
-                if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > entry
-            ])
-            sl_anchor = max(sl_candidates) if sl_candidates else None
-            tp_anchor = min(tp_candidates) if tp_candidates else None
-            return sl_anchor, tp_anchor
-        if signal == 'SELL':
-            sl_candidates = []
-            sl_candidates.extend([x for x in swing_highs if x > entry])
-            sl_candidates.extend([
-                float(ob.get('price'))
-                for ob in order_blocks
-                if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > entry
-            ])
-            sl_candidates.extend([
-                float(fvg.get('top'))
-                for fvg in fvgs
-                if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > entry
-            ])
-            tp_candidates = []
-            tp_candidates.extend([x for x in swing_lows if x < entry])
-            tp_candidates.extend([
-                float(ob.get('price'))
-                for ob in order_blocks
-                if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < entry
-            ])
-            tp_candidates.extend([
-                float(fvg.get('bottom'))
-                for fvg in fvgs
-                if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < entry
-            ])
-            sl_anchor = min(sl_candidates) if sl_candidates else None
-            tp_anchor = max(tp_candidates) if tp_candidates else None
-            return sl_anchor, tp_anchor
-    except Exception:
-        return None, None
-    return None, None
-
 def round_price(price, pair_config):
     try:
         if price is None:
@@ -1759,655 +390,6 @@ def round_price(price, pair_config):
         return round(float(price), int(pair_config.get('digits', 2)))
     except Exception:
         return None
-
-def get_entry_gap_bounds(current_price, atr, pair_config):
-    """Return (min_gap, max_gap): the institutional 'limit zone' band an entry must sit in.
-
-    min_gap guarantees a signal can never be a disguised market order — the entry must be a
-    meaningful distance from live price. max_gap keeps the limit realistic (still likely to be
-    tagged) rather than sitting so far away it may never fill. Both scale with the symbol's ATR
-    so the band automatically widens in high-volatility conditions and tightens when the market
-    is quiet.
-    """
-    try:
-        current_price = float(current_price)
-    except Exception:
-        current_price = 0.0
-    atr = float(atr) if atr else 0.0
-    min_gap = max(
-        float(pair_config.get('tick_size', 0.01) or 0.01) * 5.0,
-        current_price * float(pair_config.get('min_entry_gap_pct', 0.0009)),
-        atr * float(pair_config.get('min_entry_gap_atr', 0.12))
-    )
-    max_gap = min(
-        float(pair_config.get('max_entry_points', 35) or 35),
-        current_price * float(pair_config.get('max_entry_gap_pct', 0.0085) or 0.0085)
-    )
-    if atr:
-        max_gap = min(max_gap, atr * float(pair_config.get('limit_zone_atr', 2.2)))
-    if max_gap < min_gap:
-        max_gap = min_gap * 1.5
-    return min_gap, max_gap
-
-def infer_order_type(signal, entry=None, current_price=None, pair_config=None, atr=None):
-    # The desk only ever works resting LIMIT orders — never chases price at market and never
-    # uses breakout STOP entries. This mirrors "buy limit / sell limit" institutional execution:
-    # the AI must wait for price to retrace to its stated level before the order can fill.
-    return 'LIMIT'
-
-def compute_default_limit_entry(signal, current_price, swings, order_blocks, fvgs, atr, pair_config, vwap=None):
-    """Fallback limit-entry generator used whenever the AI's proposed entry is missing, invalid,
-    or outside the reasonable limit band. Instead of snapping to market price (the old
-    behaviour), this looks for the nearest genuine structural pullback level — an order block,
-    a fair value gap, a recent swing, or VWAP — that sits inside [min_gap, max_gap] from live
-    price. If nothing structural qualifies, it anchors a fixed ATR-based pullback distance so
-    the entry is still always a real limit, never the current price.
-    """
-    try:
-        current_price = float(current_price)
-    except Exception:
-        return None
-    if signal not in ('BUY', 'SELL'):
-        return None
-    atr = float(atr) if atr else current_price * float(pair_config.get('min_dist_pct', 0.0015))
-    min_gap, max_gap = get_entry_gap_bounds(current_price, atr, pair_config)
-    order_blocks = order_blocks or []
-    fvgs = fvgs or []
-    swings = swings or {}
-    candidates = []
-    if signal == 'BUY':
-        candidates.extend(float(ob.get('price')) for ob in order_blocks
-                           if ob.get('type') == 'BULLISH_OB' and ob.get('price') is not None and float(ob.get('price')) < current_price)
-        candidates.extend(
-            (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0
-            for fvg in fvgs
-            if fvg.get('type') == 'BULLISH_FVG' and fvg.get('top') is not None and fvg.get('bottom') is not None
-            and (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0 < current_price
-        )
-        candidates.extend(float(x) for x in swings.get('recent_swing_lows', []) if x is not None and float(x) < current_price)
-        if vwap is not None and float(vwap) < current_price:
-            candidates.append(float(vwap))
-        in_band = [c for c in candidates if min_gap <= (current_price - c) <= max_gap]
-        if in_band:
-            return max(in_band)  # closest qualifying pullback level to live price
-        default_gap = min(max(atr * float(pair_config.get('default_pullback_atr', 0.55)), min_gap), max_gap)
-        return current_price - default_gap
-    else:
-        candidates.extend(float(ob.get('price')) for ob in order_blocks
-                           if ob.get('type') == 'BEARISH_OB' and ob.get('price') is not None and float(ob.get('price')) > current_price)
-        candidates.extend(
-            (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0
-            for fvg in fvgs
-            if fvg.get('type') == 'BEARISH_FVG' and fvg.get('top') is not None and fvg.get('bottom') is not None
-            and (float(fvg.get('top')) + float(fvg.get('bottom'))) / 2.0 > current_price
-        )
-        candidates.extend(float(x) for x in swings.get('recent_swing_highs', []) if x is not None and float(x) > current_price)
-        if vwap is not None and float(vwap) > current_price:
-            candidates.append(float(vwap))
-        in_band = [c for c in candidates if min_gap <= (c - current_price) <= max_gap]
-        if in_band:
-            return min(in_band)  # closest qualifying pullback level to live price
-        default_gap = min(max(atr * float(pair_config.get('default_pullback_atr', 0.55)), min_gap), max_gap)
-        return current_price + default_gap
-
-def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair_config, atr_htf=None):
-    try:
-        entry = float(entry)
-        sl = float(sl)
-        tp = float(tp)
-        current_price = float(current_price)
-    except Exception:
-        return False, "Missing or non-numeric entry/SL/TP."
-    if entry <= 0 or sl <= 0 or tp <= 0 or current_price <= 0:
-        return False, "Entry, SL, TP, and current price must be positive."
-    # Entry-gap band uses the LTF (entry-timeframe) ATR: how far price realistically pulls
-    # back on the timeframe you're timing the entry from.
-    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr, pair_config)
-    gap = abs(entry - current_price)
-    if gap > max_entry_gap:
-        return False, f"Entry too far from live price. Gap={gap:.6f}, max={max_entry_gap:.6f}."
-    if gap < min_entry_gap:
-        return False, f"Entry too close to live price to qualify as a genuine limit order. Gap={gap:.6f}, min={min_entry_gap:.6f}."
-    order_type = str(order_type or '').upper()
-    if order_type != 'LIMIT':
-        return False, f"Only LIMIT orders are permitted; got {order_type or 'UNSET'}."
-    if signal == 'BUY' and entry >= current_price:
-        return False, "BUY LIMIT must be below current price."
-    if signal == 'SELL' and entry <= current_price:
-        return False, "SELL LIMIT must be above current price."
-    # Stop/target distance uses the HTF ATR (falls back to the entry-timeframe ATR if no HTF
-    # reading is available) since risk should be sized to the timeframe the trade thesis
-    # actually plays out on, not to 10-minute noise.
-    sizing_atr = atr_htf if atr_htf else atr
-    min_stop_distance = max(
-        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        float(sizing_atr or 0.0) * float(pair_config.get('min_stop_atr', 1.0))
-    )
-    max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
-    if sizing_atr:
-        max_stop_distance = min(max_stop_price, float(sizing_atr) * float(pair_config.get('max_stop_atr', 3.0)))
-    else:
-        max_stop_distance = max_stop_price
-    if signal == 'BUY':
-        if sl >= entry:
-            return False, f"BUY SL must be below entry. SL={sl}, entry={entry}."
-        if tp <= entry:
-            return False, f"BUY TP must be above entry. TP={tp}, entry={entry}."
-        risk = entry - sl
-        reward = tp - entry
-    elif signal == 'SELL':
-        if sl <= entry:
-            return False, f"SELL SL must be above entry. SL={sl}, entry={entry}."
-        if tp >= entry:
-            return False, f"SELL TP must be below entry. TP={tp}, entry={entry}."
-        risk = sl - entry
-        reward = entry - tp
-    else:
-        return False, "Invalid signal."
-    if risk <= 0:
-        return False, "Risk distance must be positive."
-    if risk < min_stop_distance * 0.95:
-        return False, f"Stop too tight. Risk={risk:.6f}, min={min_stop_distance:.6f}."
-    if risk > max_stop_distance * 1.05:
-        return False, f"Stop too wide. Risk={risk:.6f}, max={max_stop_distance:.6f}."
-    rr = reward / risk if risk > 0 else 0
-    min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
-    max_rr = float(pair_config.get('max_rr', 3.0))
-    if rr + 0.01 < min_rr:
-        return False, f"RR too low. RR={rr:.2f}, min={min_rr:.2f}."
-    if rr > max_rr * 1.05:
-        return False, f"RR too high / TP too far from entry. RR={rr:.2f}, max={max_rr:.2f}."
-    return True, "Valid"
-
-def build_atr_fallback_plan(signal, entry, pair_config, atr, atr_htf=None):
-    """Deterministic, always-valid SL/TP builder used only when no structural anchor (order
-    block, FVG, swing) is usable. Sizes risk purely from ATR/min-distance rules so a signal
-    is always produced — this desk never returns WAIT for lack of a plan. Uses the HTF ATR for
-    sizing when available (risk should match the timeframe the trade thesis plays out on)."""
-    entry = float(entry)
-    sizing_atr = float(atr_htf) if atr_htf else (float(atr) if atr else abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)))
-    min_stop_distance = max(
-        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        sizing_atr * float(pair_config.get('min_stop_atr', 1.0))
-    )
-    max_stop_distance = min(
-        abs(entry) * float(pair_config.get('max_risk_pct', 0.008)),
-        sizing_atr * float(pair_config.get('max_stop_atr', 3.0))
-    )
-    if max_stop_distance < min_stop_distance:
-        max_stop_distance = min_stop_distance * 1.5
-    risk = min(max(min_stop_distance * 1.15, min_stop_distance), max_stop_distance)
-    target_rr = max(float(pair_config.get('target_rr', 2.0)), float(pair_config.get('min_rr', 1.3)))
-    target_rr = min(target_rr, float(pair_config.get('max_rr', 3.0)))
-    reward = risk * target_rr
-    if signal == 'BUY':
-        sl = entry - risk
-        tp = entry + reward
-    else:
-        sl = entry + risk
-        tp = entry - reward
-    rr = round(reward / risk, 2) if risk > 0 else 0
-    return {
-        'entry': round_price(entry, pair_config),
-        'stop_loss': round_price(sl, pair_config),
-        'take_profit': [round_price(tp, pair_config)],
-        'exhaustion_target': round_price(tp, pair_config),
-        'rr_ratio': rr,
-        'risk_band': round_price(risk, pair_config),
-        'order_type': 'LIMIT',
-        'levels_source': 'PYTHON_ATR_FALLBACK',
-    }
-
-def finalize_trade_plan(analysis, symbol, current_price,
-                         ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
-                         htf_swings, htf_order_blocks, htf_fvgs, atr_htf,
-                         pair_config, htf_df=None, ltf_df=None):
-    """Builds/validates the final entry+SL+TP. Entry (and the min/max limit-order gap it must
-    sit in) is anchored to LTF structure/ATR (M15/M30) — the timeframe a pullback entry is
-    actually timed from. SL/TP/exhaustion-target sizing is anchored to HTF structure/ATR (H1/
-    H4) — the timeframe the trade thesis is actually based on. atr_htf falls back to atr_ltf if
-    HTF data is unavailable so the desk can still always produce a valid plan."""
-    if not isinstance(analysis, dict):
-        return analysis
-    signal = analysis.get('signal')
-    if signal not in ('BUY', 'SELL'):
-        return analysis
-    try:
-        current_price = float(current_price)
-    except Exception:
-        return analysis
-    atr_htf = atr_htf or atr_ltf
-    entry = analysis.get('entry')
-    try:
-        entry = float(entry)
-    except Exception:
-        entry = None
-    min_entry_gap, max_entry_gap = get_entry_gap_bounds(current_price, atr_ltf, pair_config)
-    gap = abs(entry - current_price) if entry else None
-    needs_recompute = entry is None or entry <= 0 or gap is None or gap > max_entry_gap or gap < min_entry_gap
-    # Directional sanity: a BUY entry must sit below live price and a SELL entry above it,
-    # otherwise the AI proposed a market/stop-style level, which is not permitted here.
-    if entry is not None and entry > 0:
-        if signal == 'BUY' and entry >= current_price:
-            needs_recompute = True
-        if signal == 'SELL' and entry <= current_price:
-            needs_recompute = True
-    if needs_recompute:
-        vwap = None
-        try:
-            if ltf_df is not None and not ltf_df.empty:
-                micro = calculate_microstructure(ltf_df)
-                vwap = micro.get('vwap')
-        except Exception:
-            vwap = None
-        computed_entry = compute_default_limit_entry(signal, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf, pair_config, vwap=vwap)
-        entry = computed_entry if computed_entry else (
-            current_price - max(min_entry_gap, (atr_ltf or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
-            if signal == 'BUY' else
-            current_price + max(min_entry_gap, (atr_ltf or 0) * float(pair_config.get('default_pullback_atr', 0.55)))
-        )
-        analysis['order_type'] = 'LIMIT'
-        analysis['levels_source'] = 'PYTHON'
-        add_python_validation_note(analysis, "Entry was re-anchored to the nearest qualifying M15/M30 structural pullback level (order block / FVG / swing / VWAP) because the proposed entry was missing, too close to a market order, or outside the reasonable limit-order band.")
-    analysis['order_type'] = 'LIMIT'
-    canonical_plan = build_structural_plan_v2(
-        signal=signal,
-        entry=entry,
-        current_price=current_price,
-        swings=htf_swings,
-        order_blocks=htf_order_blocks,
-        fvgs=htf_fvgs,
-        atr=atr_htf,
-        pair_config=pair_config,
-        market_df=htf_df
-    )
-    if canonical_plan:
-        analysis['stop_loss'] = canonical_plan['stop_loss']
-        analysis['take_profit'] = canonical_plan['take_profit']
-        analysis['exhaustion_target'] = canonical_plan['exhaustion_target']
-        analysis['levels_source'] = 'PYTHON_EXHAUSTION_TARGET'
-        add_python_validation_note(analysis, "TP is the nearest executable H1/H4 exhaustion/liquidity target; SL is beyond H1/H4 structural invalidation with HTF-ATR buffering.")
-    analysis['entry'] = round_price(entry, pair_config)
-    sl = analysis.get('stop_loss')
-    tp_list = analysis.get('take_profit', [])
-    tp = tp_list[0] if tp_list else None
-    ok, reason = check_level_math(
-        signal=signal,
-        order_type=analysis.get('order_type'),
-        entry=entry,
-        sl=sl,
-        tp=tp,
-        current_price=current_price,
-        atr=atr_ltf,
-        pair_config=pair_config,
-        atr_htf=atr_htf
-    )
-    if not ok:
-        plan = build_structural_plan_v2(
-            signal=signal,
-            entry=entry,
-            current_price=current_price,
-            swings=htf_swings,
-            order_blocks=htf_order_blocks,
-            fvgs=htf_fvgs,
-            atr=atr_htf,
-            pair_config=pair_config,
-            market_df=htf_df
-        )
-        if not plan:
-            # Last-resort deterministic ATR-based plan. No WAIT signals are produced by this
-            # desk — if no structural anchor is usable, a clean risk-defined limit trade is
-            # built directly from HTF volatility so the analysis always resolves to an
-            # executable BUY/SELL limit.
-            plan = build_atr_fallback_plan(signal, entry, pair_config, atr_ltf, atr_htf=atr_htf)
-            add_python_validation_note(analysis, f"No structural SL/TP anchor was usable ({reason}); levels were built directly from HTF ATR risk sizing instead.")
-        analysis.update(plan)
-    analysis['entry'] = round_price(analysis.get('entry'), pair_config)
-    analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
-    if analysis.get('take_profit'):
-        analysis['take_profit'] = [
-            round_price(x, pair_config)
-            for x in analysis.get('take_profit')
-            if x is not None
-        ]
-    final_entry = analysis.get('entry')
-    final_sl = analysis.get('stop_loss')
-    final_tp = (analysis.get('take_profit') or [None])[0]
-    ok_final, reason_final = check_level_math(
-        signal=analysis.get('signal'),
-        order_type=analysis.get('order_type'),
-        entry=final_entry,
-        sl=final_sl,
-        tp=final_tp,
-        current_price=current_price,
-        atr=atr_ltf,
-        pair_config=pair_config,
-        atr_htf=atr_htf
-    )
-    if not ok_final:
-        # Deterministic safety net: rebuild from HTF ATR risk sizing directly off the (already
-        # band-validated) entry rather than surrendering to a WAIT signal.
-        plan = build_atr_fallback_plan(analysis.get('signal'), final_entry, pair_config, atr_ltf, atr_htf=atr_htf)
-        analysis.update(plan)
-        analysis['entry'] = round_price(analysis.get('entry'), pair_config)
-        analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
-        analysis['take_profit'] = [round_price(x, pair_config) for x in analysis.get('take_profit', []) if x is not None]
-        add_python_validation_note(analysis, f"Final level validation rebuilt the plan from HTF ATR risk sizing (previous levels failed: {reason_final}).")
-    entry_f = float(analysis['entry'])
-    sl_f = float(analysis['stop_loss'])
-    tp_f = float(analysis['take_profit'][0])
-    if analysis['signal'] == 'BUY':
-        risk = entry_f - sl_f
-        reward = tp_f - entry_f
-    else:
-        risk = sl_f - entry_f
-        reward = entry_f - tp_f
-    analysis['rr_ratio'] = round(reward / risk, 2) if risk > 0 else 0
-    analysis['exhaustion_target'] = analysis.get('exhaustion_target', analysis.get('take_profit', [None])[0])
-    analysis['risk_band'] = round_price(risk, pair_config)
-    analysis.setdefault('levels_source', 'HYBRID')
-    return analysis
-
-def normalize_ai_signal(signal):
-    if not isinstance(signal, str):
-        return signal
-    normalized = signal.strip().upper()
-    if normalized in {'BULLISH', 'LONG', 'BUY'}:
-        return 'BUY'
-    if normalized in {'BEARISH', 'SHORT', 'SELL'}:
-        return 'SELL'
-    if normalized in {'WAIT', 'NO_TRADE', 'NONE'}:
-        return 'WAIT'
-    return signal
-
-def normalize_analysis_signals(analysis):
-    if not isinstance(analysis, dict):
-        return analysis
-    if 'signal' in analysis:
-        analysis['signal'] = normalize_ai_signal(analysis['signal'])
-    if 'candidate_direction' in analysis:
-        analysis['candidate_direction'] = normalize_ai_signal(analysis['candidate_direction'])
-    return analysis
-
-def add_python_validation_note(analysis, note):
-    if not note:
-        return analysis
-    notes = analysis.setdefault('python_validation_notes', [])
-    if note not in notes:
-        notes.append(note)
-    return analysis
-
-def validate_ai_logic(analysis):
-    signal = analysis.get('signal')
-    reasoning = (analysis.get('reasoning') or '').lower()
-    micro_read = (analysis.get('microstructure_read') or '').lower()
-    buy_bad = ['invalidates the buy', 'invalidates the long', 'invalid buy', 'invalid long',
-               'buy setup is invalid', 'long setup is invalid', 'do not buy', "don't buy",
-               'avoid buying', 'no buy setup', 'buy is invalidated']
-    sell_bad = ['invalidates the sell', 'invalidates the short', 'invalid sell', 'invalid short',
-                'sell setup is invalid', 'short setup is invalid', 'do not sell', "don't sell",
-                'avoid selling', 'no sell setup', 'sell is invalidated']
-    if signal == 'BUY':
-        if any(p in reasoning for p in buy_bad):
-            return False, 'The reasoning explicitly invalidates the BUY setup.'
-        if any(t in micro_read for t in ['exhaustion', 'trap']):
-            if not any(t in reasoning for t in ['pullback', 'retest', 'reclaim', 'confirmation', 'liquidity', 'sweep', 'zone', 'order block', 'fvg']):
-                return False, 'Microstructure suggests a trap or exhaustion and the reasoning lacks a clear continuation or invalidation framework.'
-    elif signal == 'SELL':
-        if any(p in reasoning for p in sell_bad):
-            return False, 'The reasoning explicitly invalidates the SELL setup.'
-        if any(t in micro_read for t in ['exhaustion', 'trap']):
-            if not any(t in reasoning for t in ['pullback', 'retest', 'reclaim', 'confirmation', 'liquidity', 'sweep', 'zone', 'order block', 'fvg']):
-                return False, 'Microstructure suggests a trap or exhaustion and the reasoning lacks a clear continuation or invalidation framework.'
-    return True, 'Valid'
-
-def validate_signal_math(analysis, pair_config=None):
-    signal = analysis.get('signal')
-    if signal not in ['BUY', 'SELL']:
-        return False, 'Invalid signal direction.'
-    pair_config = pair_config or {}
-    entry = analysis.get('entry')
-    sl = analysis.get('stop_loss')
-    tp_list = analysis.get('take_profit', [])
-    tp1 = tp_list[0] if tp_list else None
-    if entry is None or sl is None or tp1 is None:
-        return False, 'Missing entry, SL, or TP values after finalization.'
-    try:
-        entry = float(entry)
-        sl = float(sl)
-        tp1 = float(tp1)
-    except Exception:
-        return False, 'Entry, SL, and TP must be numeric.'
-    if signal == 'BUY':
-        if tp1 <= entry:
-            return False, f'Invalid Math: For BUY, TP1 ({tp1}) MUST be > Entry ({entry}).'
-        if sl >= entry:
-            return False, f'Invalid Math: For BUY, SL ({sl}) MUST be < Entry ({entry}).'
-    elif signal == 'SELL':
-        if tp1 >= entry:
-            return False, f'Invalid Math: For SELL, TP1 ({tp1}) MUST be < Entry ({entry}).'
-        if sl <= entry:
-            return False, f'Invalid Math: For SELL, SL ({sl}) MUST be > Entry ({entry}).'
-    risk = abs(entry - sl)
-    reward = abs(entry - tp1)
-    if risk <= 0:
-        return False, 'Risk distance must be positive.'
-    min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
-    if (reward / risk) + 0.01 < min_rr:
-        return False, f'Invalid Math: R:R is too low ({(reward / risk):.2f}). Minimum required is 1:{min_rr:.2f}.'
-    return True, 'Valid'
-
-def apply_dxy_guardrails(analysis, symbol, dxy_context):
-    if symbol not in ['XAUUSD', 'EURUSD', 'BTCUSD'] or not dxy_context:
-        return analysis
-    trend = dxy_context.get('trend')
-    price_vs_vwap = dxy_context.get('price_vs_vwap')
-    reasoning = (analysis.get('reasoning') or '').lower()
-    signal = analysis.get('signal')
-    if trend == 'BULLISH' and price_vs_vwap == 'ABOVE':
-        expected_bias = 'SELL'
-    elif trend == 'BEARISH' and price_vs_vwap == 'BELOW':
-        expected_bias = 'BUY'
-    else:
-        expected_bias = None
-    if expected_bias is None:
-        analysis['dxy_correlation'] = 'NEUTRAL'
-        return analysis
-    if signal == expected_bias:
-        analysis['dxy_correlation'] = 'CONFIRMING'
-        if 'dxy' not in reasoning and 'dollar' not in reasoning:
-            add_python_validation_note(analysis, f"DXY confirms the bias: the dollar index is {trend.lower()} and price is {price_vs_vwap.lower()} VWAP.")
-        return analysis
-    analysis['dxy_correlation'] = 'CONTRADICTING'
-    if analysis.get('confidence') == 'HIGH':
-        analysis['confidence'] = 'MEDIUM'
-        analysis['confluence_score'] = max(0, analysis.get('confluence_score', 0) - 4)
-    if 'dxy' not in reasoning and 'dollar' not in reasoning:
-        add_python_validation_note(analysis, "The setup is contrarian versus the DXY bias and therefore needs stronger macro confirmation.")
-    return analysis
-
-def apply_htf_trend_guard(analysis, symbol, htf_context):
-    if analysis.get('signal') not in ['BUY', 'SELL'] or not isinstance(htf_context, dict):
-        return analysis
-    trend = str(htf_context.get('trend') or '').upper()
-    bias = str(htf_context.get('bias') or '').upper()
-    if trend not in {'BULLISH', 'BEARISH'} and bias not in {'BULLISH', 'BEARISH'}:
-        return analysis
-    expected_bias = trend or bias
-    signal = analysis.get('signal')
-    if (signal == 'BUY' and expected_bias == 'BEARISH') or (signal == 'SELL' and expected_bias == 'BULLISH'):
-        analysis['confidence'] = 'MEDIUM' if analysis.get('confidence') == 'HIGH' else analysis.get('confidence')
-        analysis['confluence_score'] = min(analysis.get('confluence_score', 0), 78)
-        add_python_validation_note(analysis, f"Higher-timeframe trend is {expected_bias.lower()}, so this countertrend idea has reduced conviction and needs strong structural confirmation.")
-    return analysis
-
-def cross_check_ai_evidence(analysis):
-    ev = analysis.get('directional_evidence')
-    if not isinstance(ev, dict):
-        return analysis
-    bull = ev.get('bullish') or []
-    bear = ev.get('bearish') or []
-    if not isinstance(bull, list) or not isinstance(bear, list):
-        return analysis
-    signal = analysis.get('signal')
-    if signal == 'BUY' and len(bear) - len(bull) >= 2:
-        analysis['confidence'] = 'MEDIUM' if analysis.get('confidence') == 'HIGH' else analysis.get('confidence')
-        analysis['confluence_score'] = min(analysis.get('confluence_score', 0), 74)
-        add_python_validation_note(analysis, "The AI evidence ledger was bearish-heavy, so bullish conviction was reduced.")
-    elif signal == 'SELL' and len(bull) - len(bear) >= 2:
-        analysis['confidence'] = 'MEDIUM' if analysis.get('confidence') == 'HIGH' else analysis.get('confidence')
-        analysis['confluence_score'] = min(analysis.get('confluence_score', 0), 74)
-        add_python_validation_note(analysis, "The AI evidence ledger was bullish-heavy, so bearish conviction was reduced.")
-    return analysis
-
-def apply_direction_correction_guard(analysis, confluence, symbol):
-    signal = analysis.get('signal')
-    if signal not in ('BUY', 'SELL') or not confluence:
-        return analysis
-    direction = confluence.get('direction')
-    bull = confluence.get('bull_count', 0)
-    bear = confluence.get('bear_count', 0)
-    lead = abs(bull - bear)
-    if direction and direction != signal and max(bull, bear) >= 3 and lead >= 2:
-        analysis['signal'] = direction
-        analysis['confidence'] = 'MEDIUM'
-        analysis['confluence_score'] = max(MINIMUM_CONFLUENCE_SCORE, min(analysis.get('confluence_score', 0), 82))
-        ev = confluence.get('bullish_evidence') if direction == 'BUY' else confluence.get('bearish_evidence')
-        add_python_validation_note(analysis, f"Direction corrected to {direction} by the structural evidence audit: {'; '.join(ev[:4])}.")
-        analysis['rejection_reason'] = None
-    elif direction == signal:
-        ev = confluence.get('bullish_evidence') if signal == 'BUY' else confluence.get('bearish_evidence')
-        analysis['confluence_score'] = min(100, analysis.get('confluence_score', 0) + 2)
-        add_python_validation_note(analysis, f"Directional evidence audit confirms the {signal} side: {'; '.join(ev[:4])}.")
-    return analysis
-
-def apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, current_price, swings, symbol, pair_config=None):
-    signal = analysis.get('signal')
-    if signal not in ['BUY', 'SELL']:
-        return analysis
-    structural_score = (structural_context or {}).get('structural_score', 0)
-    reasoning = (analysis.get('reasoning') or '').lower()
-    recent_patterns = [c.get('pattern') for c in (candles or []) if c.get('pattern')]
-    strong_recent = any(pattern in {'STRONG_BULLISH', 'STRONG_BEARISH', 'HAMMER', 'INVERTED_HAMMER', 'REJECTION_LOW', 'REJECTION_HIGH'} for pattern in recent_patterns)
-    structural_markers = any(term in reasoning for term in ['order block', 'fvg', 'liquidity', 'retest', 'reclaim', 'zone', 'bos', 'choch', 'sweep'])
-    if current_price is not None and swings:
-        valid_swing_lows = [l for l in swings.get('recent_swing_lows', []) if l < current_price]
-        valid_swing_highs = [h for h in swings.get('recent_swing_highs', []) if h > current_price]
-    else:
-        valid_swing_lows = []
-        valid_swing_highs = []
-    has_clear_anchor = bool((signal == 'BUY' and valid_swing_lows) or (signal == 'SELL' and valid_swing_highs))
-    has_structure_support = structural_score >= 60 or strong_recent or structural_markers or (has_clear_anchor and structural_score >= 55)
-    if not has_structure_support:
-        analysis['confidence'] = 'LOW'
-        analysis['confluence_score'] = max(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE)
-        analysis['rejection_reason'] = 'Structure is still forming, so the setup remains an early candidate rather than a hard no-trade.'
-    return analysis
-
-def build_display_reason(analysis, symbol, current_price=None, phase_context=None, structural_context=None, dxy_context=None):
-    reasoning = (analysis.get('reasoning') or '').strip()
-    rejection = (analysis.get('rejection_reason') or '').strip()
-    setup_context = analysis.get('setup_context') or {}
-    phase = (phase_context or {}).get('phase') or setup_context.get('phase') or analysis.get('market_state') or 'unknown'
-    setup_type = setup_context.get('setup_type') or analysis.get('market_state') or 'unknown'
-    timing = setup_context.get('entry_timing') or (phase_context or {}).get('entry_quality') or 'unknown'
-    signal = analysis.get('signal')
-    score = analysis.get('confluence_score')
-    confidence = analysis.get('confidence')
-    dxy_status = analysis.get('dxy_correlation') or ('CONFIRMING' if dxy_context else '')
-    entry = analysis.get('entry')
-    current = current_price if current_price is not None else entry
-    parts = []
-    if reasoning:
-        parts.append(reasoning)
-    if analysis.get('confluence_breakdown'):
-        parts.append(f"Confluence breakdown: {analysis.get('confluence_breakdown')}")
-    else:
-        breakdown_parts = []
-        dxy = analysis.get('dxy_correlation') or 'N/A'
-        micro = analysis.get('microstructure_read') or ''
-        rsi_ctx = analysis.get('rsi_context') or ''
-        struct_score = analysis.get('structural_score') if structural_context is None else structural_context.get('structural_score')
-        live_price = analysis.get('live_price') or current_price
-        if dxy:
-            breakdown_parts.append(f"DXY: {dxy}")
-        if micro:
-            breakdown_parts.append(f"VWAP/RVOL: {micro}")
-        if rsi_ctx:
-            breakdown_parts.append(f"RSI: {rsi_ctx}")
-        if struct_score is not None:
-            breakdown_parts.append(f"Structure score: {struct_score}/100")
-        if live_price is not None:
-            try:
-                breakdown_parts.append(f"Live price: {float(live_price):.2f}")
-            except Exception:
-                breakdown_parts.append(f"Live price: {live_price}")
-        if breakdown_parts:
-            parts.append('Confluence breakdown: ' + ' | '.join(breakdown_parts))
-        else:
-            parts.append(f"{symbol} is being assessed from the current market and execution context.")
-    if phase and phase != 'unknown':
-        parts.append(f"Market state is {phase}.")
-    if setup_type and setup_type != 'unknown':
-        parts.append(f"Setup type is {setup_type}.")
-    if timing and timing != 'unknown':
-        parts.append(f"Entry timing is {timing}.")
-    if current is not None and entry is not None and current not in [0, None]:
-        gap_pct = abs(entry - current) / current * 100 if current else 0.0
-        parts.append(f"The proposed entry is about {gap_pct:.2f}% from the live price.")
-    if dxy_status:
-        parts.append(f"DXY correlation is {dxy_status.lower()}.")
-    if score is not None:
-        parts.append(f"Confluence score is {score}/100 with {confidence.lower() if confidence else 'unknown'} confidence.")
-    if rejection and signal == 'WAIT':
-        parts.append(f"Decision: {rejection}")
-    elif rejection:
-        parts.append(f"Decision: {rejection}")
-    return ' '.join(parts)
-
-def build_validation_detail(analysis, swings, current_price, symbol, pair_config=None, structural_context=None):
-    signal = analysis.get('signal')
-    if signal not in ['BUY', 'SELL']:
-        return 'No trade signal was produced because the setup did not meet the required structural or risk criteria.'
-    pair_config = pair_config or {}
-    min_dist = current_price * pair_config.get('min_dist_pct', 0.001)
-    target_rr = pair_config.get('min_rr', pair_config.get('target_rr', 1.3))
-    entry = analysis.get('entry', current_price)
-    sl = analysis.get('stop_loss')
-    tp_list = analysis.get('take_profit', [])
-    tp1 = tp_list[0] if tp_list else None
-    reasons = []
-    if signal == 'BUY':
-        if sl is None or sl >= entry:
-            reasons.append(f'SL is not below entry ({sl} >= {entry}).')
-        else:
-            risk = entry - sl
-            if risk + 1e-6 < min_dist:
-                reasons.append(f'SL is too close to entry; risk is {risk:.4f}, below the minimum {min_dist:.4f} for {symbol}.')
-        if tp1 is None or tp1 <= entry:
-            reasons.append(f'TP is not above entry ({tp1} <= {entry}).')
-        else:
-            reward = tp1 - entry
-            risk = entry - sl if sl is not None else 0
-            if risk > 0 and (reward / risk) + 0.01 < target_rr:
-                reasons.append(f'The proposed risk/reward is too low ({reward / risk:.2f} vs required {target_rr:.2f}).')
-    else:
-        if sl is None or sl <= entry:
-            reasons.append(f'SL is not above entry ({sl} <= {entry}).')
-        else:
-            risk = sl - entry
-            if risk + 1e-6 < min_dist:
-                reasons.append(f'SL is too close to entry; risk is {risk:.4f}, below the minimum {min_dist:.4f} for {symbol}.')
-        if tp1 is None or tp1 >= entry:
-            reasons.append(f'TP is not below entry ({tp1} >= {entry}).')
-        else:
-            reward = entry - tp1
-            risk = sl - entry if sl is not None else 0
-            if risk > 0 and (reward / risk) + 0.01 < target_rr:
-                reasons.append(f'The proposed risk/reward is too low ({reward / risk:.2f} vs required {target_rr:.2f}).')
-    if structural_context and structural_context.get('structural_score', 0) < 70:
-        reasons.append('The structural score is too weak for a high-quality setup.')
-    return ' '.join(reasons) if reasons else 'The setup did not meet the structural and risk requirements for execution.'
 
 def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
     fallback_price = None
@@ -2561,9 +543,6 @@ def set_model_cooldown(model, seconds):
     cooldowns = st.session_state.setdefault('groq_model_cooldowns', {})
     cooldowns[model] = datetime.now() + timedelta(seconds=max(1, int(seconds)))
 
-# HTTP statuses that mean "this model id is genuinely unusable right now" (deprecated,
-# decommissioned, not entitled, bad request shape) — retrying the SAME model won't help, so we
-# move straight to the next model in the list without burning retries on it.
 _GROQ_NON_RETRYABLE_STATUSES = {400, 401, 403, 404, 422}
 
 def call_groq(system_prompt, user_content, max_tokens=None, retry_count=0, estimated_tokens=None, image_b64=None, image_mime_type='image/png'):
@@ -2759,464 +738,1896 @@ def call_groq(system_prompt, user_content, max_tokens=None, retry_count=0, estim
             "model_attempts": attempts_log,
             "raw_output": "\n".join(model_errors[-4:])}
 
-def build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, candles=None, phase_context=None, live_price=None, htf_context=None, picture=None, firm=None, firm_notes=None, learning=None, historical_context=None):
-    if not st.session_state.get("_upgrade_fallback_warned"):
-        try:
-            add_notification("warning", "Groq AI is unavailable (missing API key or rate-limited). Signals are coming from the Python fallback model. Verify GROQ_API_KEY in Streamlit Secrets for full-quality institutional analysis.")
-        except Exception:
-            pass
-        st.session_state._upgrade_fallback_warned = True
-        
-    micro = calculate_microstructure(m10) or {}
-    regime = classify_market_regime(m10)
+def normalize_ai_signal(signal):
+    if not isinstance(signal, str):
+        return signal
+    normalized = signal.strip().upper()
+    if normalized in {'BULLISH', 'LONG', 'BUY'}:
+        return 'BUY'
+    if normalized in {'BEARISH', 'SHORT', 'SELL'}:
+        return 'SELL'
+    if normalized in {'WAIT', 'NO_TRADE', 'NONE'}:
+        return 'WAIT'
+    return signal
+
+def normalize_analysis_signals(analysis):
+    if not isinstance(analysis, dict):
+        return analysis
+    if 'signal' in analysis:
+        analysis['signal'] = normalize_ai_signal(analysis['signal'])
+    if 'candidate_direction' in analysis:
+        analysis['candidate_direction'] = normalize_ai_signal(analysis['candidate_direction'])
+    return analysis
+
+def add_python_validation_note(analysis, note):
+    if not note:
+        return analysis
+    notes = analysis.setdefault('python_validation_notes', [])
+    if note not in notes:
+        notes.append(note)
+    return analysis
+
+def validate_signal_math(analysis, pair_config=None):
+    signal = analysis.get('signal')
+    if signal not in ['BUY', 'SELL']:
+        return False, 'Invalid signal direction.'
+    pair_config = pair_config or {}
+    entry = analysis.get('entry')
+    sl = analysis.get('stop_loss')
+    tp_list = analysis.get('take_profit', [])
+    tp1 = tp_list[0] if tp_list else None
+    if entry is None or sl is None or tp1 is None:
+        return False, 'Missing entry, SL, or TP values after finalization.'
     try:
-        current_price = float(live_price) if live_price is not None else float(m10["Close"].iloc[-1])
+        entry = float(entry)
+        sl = float(sl)
+        tp1 = float(tp1)
     except Exception:
-        current_price = None
-        
-    if current_price is None:
+        return False, 'Entry, SL, and TP must be numeric.'
+    if signal == 'BUY':
+        if tp1 <= entry:
+            return False, f'Invalid Math: For BUY, TP1 ({tp1}) MUST be > Entry ({entry}).'
+        if sl >= entry:
+            return False, f'Invalid Math: For BUY, SL ({sl}) MUST be < Entry ({entry}).'
+    elif signal == 'SELL':
+        if tp1 >= entry:
+            return False, f'Invalid Math: For SELL, TP1 ({tp1}) MUST be < Entry ({entry}).'
+        if sl <= entry:
+            return False, f'Invalid Math: For SELL, SL ({sl}) MUST be > Entry ({entry}).'
+    risk = abs(entry - sl)
+    reward = abs(entry - tp1)
+    if risk <= 0:
+        return False, 'Risk distance must be positive.'
+    min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
+    if (reward / risk) + 0.01 < min_rr:
+        return False, f'Invalid Math: R:R is too low ({(reward / risk):.2f}). Minimum required is 1:{min_rr:.2f}.'
+    return True, 'Valid'
+
+# =============================================================================
+# ── V3 CORE: PERSISTENT STATE ───────────────────────────────────────────────
+# Bias and trade plans now survive Streamlit reruns/restarts (JSON file), which
+# is what makes hysteresis and "plan lock" real. Previously the bias lived only
+# in st.session_state and was lost on every new session.
+# =============================================================================
+STATE_PATH = os.environ.get('DERAI_STATE_PATH') or 'der_ai_state.json'
+BIAS_DIRECTIONAL_THRESHOLD = 25.0   # |bias score| needed for a directional HTF read
+BIAS_FLIP_THRESHOLD = 45.0          # |bias score| needed (plus a structure break) to flip a standing bias
+BIAS_MIN_HOLD_HOURS = 3.0           # a bias can't flip sooner than this
+MAX_LEDGER = 400
+LIVE_PLAN_STATUSES = ('PENDING', 'FILLED')
+CLOSED_PLAN_STATUSES = ('TP_HIT', 'SL_HIT', 'MISSED', 'EXPIRED', 'CANCELLED', 'STALE')
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def parse_ts(value):
+    try:
+        if value is None:
+            return None
+        ts = pd.Timestamp(value)
+        return ts.tz_localize('UTC') if ts.tzinfo is None else ts.tz_convert('UTC')
+    except Exception:
+        return None
+
+def to_jsonable(obj):
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [to_jsonable(v) for v in obj]
+    if isinstance(obj, (pd.DataFrame, pd.Series, pd.Index)):
+        return None
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, (np.floating, float)):
+        f = float(obj)
+        return f if np.isfinite(f) else None
+    if isinstance(obj, (pd.Timestamp, datetime)):
+        return obj.isoformat()
+    return obj
+
+def _default_state():
+    return {'version': 3, 'bias': {}, 'plans': {}, 'ledger': []}
+
+def load_state(force=False):
+    """Session cache first; `force=True` re-reads the file (used at the start of every run so
+    two browser sessions can't drift apart)."""
+    cached = st.session_state.get('persist_state')
+    if cached is not None and not force:
+        return cached
+    state = cached if cached is not None else _default_state()
+    try:
+        if os.path.exists(STATE_PATH):
+            with open(STATE_PATH, 'r', encoding='utf-8') as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                fresh = _default_state()
+                for key in fresh:
+                    if isinstance(loaded.get(key), type(fresh[key])):
+                        fresh[key] = loaded[key]
+                state = fresh
+    except Exception as exc:
+        print(f"⚠️ State load failed ({STATE_PATH}): {exc}")
+    st.session_state.persist_state = state
+    return state
+
+def save_state():
+    state = load_state()
+    try:
+        tmp_path = STATE_PATH + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8') as fh:
+            json.dump(to_jsonable(state), fh)
+        os.replace(tmp_path, STATE_PATH)
+        return True
+    except Exception as exc:
+        print(f"⚠️ State save failed ({STATE_PATH}): {exc}")
+        return False
+
+def reset_state():
+    st.session_state.persist_state = _default_state()
+    save_state()
+
+# =============================================================================
+# ── V3 CORE: CANDLE HYGIENE & INDICATORS ────────────────────────────────────
+# =============================================================================
+def infer_bar_minutes(df):
+    try:
+        if df is None or len(df) < 3:
+            return None
+        diffs = df.index.to_series().diff().dropna()
+        if diffs.empty:
+            return None
+        return max(1, int(round(diffs.median().total_seconds() / 60.0)))
+    except Exception:
+        return None
+
+def closed_candles(df):
+    """Drop the still-forming last candle. Structure (pivots, order blocks, FVGs, breaks) must
+    only ever be computed from CLOSED candles — computing it on the forming bar is exactly why
+    entries used to jump every time a fresh high/low printed."""
+    if df is None or df.empty or len(df) < 3:
+        return df
+    mins = infer_bar_minutes(df)
+    if not mins:
+        return df
+    try:
+        last_open = df.index[-1]
+        last_open = last_open.tz_localize('UTC') if last_open.tzinfo is None else last_open.tz_convert('UTC')
+        if utc_now() < last_open.to_pydatetime() + timedelta(minutes=mins):
+            return df.iloc[:-1]
+    except Exception:
+        pass
+    return df
+
+def resample_ohlcv(df, rule, origin='start_day'):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    try:
+        agg = {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+        if 'Volume' in df.columns:
+            agg['Volume'] = 'sum'
+        out = df.resample(rule, label='left', closed='left', origin=origin).agg(agg)
+        return out.dropna(subset=['Open', 'High', 'Low', 'Close'])
+    except Exception as exc:
+        print(f"⚠️ Resample failed ({rule}): {exc}")
+        return pd.DataFrame()
+
+def ensure_h4(h1, h4):
+    """Yahoo has no 4h interval and silently falls back to DAILY candles, which makes 'H4'
+    structure meaningless. If the H4 frame isn't really ~4h, build it from H1."""
+    try:
+        mins = infer_bar_minutes(h4) if h4 is not None and not h4.empty else None
+        if mins and mins <= 300 and len(h4) >= 30:
+            return h4
+        if h1 is not None and len(h1) >= 40:
+            rebuilt = resample_ohlcv(h1, '4h')
+            if len(rebuilt) >= 20:
+                return rebuilt
+    except Exception:
+        pass
+    return h4
+
+def _true_range(df):
+    high = pd.to_numeric(df['High'], errors='coerce')
+    low = pd.to_numeric(df['Low'], errors='coerce')
+    close = pd.to_numeric(df['Close'], errors='coerce')
+    return pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+
+def calculate_atr(df, period=14):
+    """Wilder ATR (the old version was a simple rolling mean, which reacts differently to spikes)."""
+    if df is None or len(df) < period + 2:
+        return None
+    atr = _true_range(df).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().iloc[-1]
+    return float(atr) if pd.notna(atr) else None
+
+def calculate_rsi(series, period=14):
+    """Wilder RSI (old version used a simple rolling average and produced different values from
+    every charting platform, and had a divergence detector that always returned *something*)."""
+    if series is None:
+        return pd.Series(dtype=float)
+    s = pd.to_numeric(pd.Series(series), errors='coerce')
+    if len(s) < 2:
+        return pd.Series([50.0] * len(s), index=s.index, dtype=float)
+    delta = s.diff()
+    up = delta.clip(lower=0)
+    down = (-delta).clip(lower=0)
+    avg_up = up.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    avg_dn = down.ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean()
+    rs = avg_up / avg_dn.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(~((avg_dn == 0) & (avg_up > 0)), 100.0)
+    return rsi.fillna(50.0).astype(float)
+
+def calculate_microstructure(df):
+    """VWAP is now anchored to the current UTC day for intraday frames (the old one was
+    cumulative over the entire download, i.e. meaningless after a few days)."""
+    if df is None or len(df) < 2:
+        return {}
+    try:
+        d = df.copy()
+        for col in ['High', 'Low', 'Close']:
+            d[col] = pd.to_numeric(d[col], errors='coerce')
+        vol = pd.to_numeric(d['Volume'], errors='coerce').fillna(0) if 'Volume' in d.columns else pd.Series(0.0, index=d.index)
+        tp = (d['High'] + d['Low'] + d['Close']) / 3
+        mins = infer_bar_minutes(d)
+        if mins and mins < 240:
+            day_start = d.index[-1].normalize()
+            sess = d[d.index >= day_start]
+            if len(sess) < 6:
+                sess = d.tail(48)
+        else:
+            sess = d.tail(50)
+        tps, vs = tp.loc[sess.index], vol.loc[sess.index]
+        vwap = float((tps * vs).sum() / vs.sum()) if vs.sum() > 0 else float(tps.mean())
+        price = float(d['Close'].iloc[-1])
+        avg_vol = float(vol.tail(21).iloc[:-1].mean()) if len(vol) > 2 else 0.0
+        rvol = float(vol.iloc[-1]) / avg_vol if avg_vol > 0 else 1.0
+        anchor = -min(5, len(d))
+        price_change = price - float(d['Close'].iloc[anchor])
         return {
-            "bias": "RANGING", "signal": "WAIT", "confluence_score": 40, "confidence": "LOW",
-            "dxy_correlation": "NEUTRAL", "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-                micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-            "reasoning": "No trade: No reliable current price available.", "rejection_reason": "No reliable current price available.",
-            "structural_score": 40, "score_reason": "Upgraded model declined the setup.", "candidate_direction": None,
-            "levels_source": "PYTHON", "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
+            "vwap": round(vwap, 5 if price < 10 else 2),
+            "price_vs_vwap": "ABOVE" if price > vwap else "BELOW",
+            "rvol": round(rvol, 2),
+            "volume_anomaly": "HIGH_INSTITUTIONAL" if rvol > 2.0 else "NORMAL",
+            "momentum": "BULLISH" if price_change > 0 else "BEARISH",
         }
-        
-    order_blocks = detect_order_blocks(m10)
-    fvgs = detect_fvg(m10)
-    all_data_ref = st.session_state.get("cached_market_data", {}) or {}
-    vote = multi_strategy_vote(symbol, all_data_ref, m10, current_price, swings, order_blocks, fvgs)
-    htf_dir = htf_direction_gate(symbol, all_data_ref)
-    reversal = detect_reversal(m10)
-    direction = vote.get("direction")
-    
-    if direction is None:
-        return {
-            "bias": "RANGING", "signal": "WAIT", "confluence_score": 40, "confidence": "LOW",
-            "dxy_correlation": "NEUTRAL", "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-                micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-            "reasoning": "No trade: Multi-strategy confluence found no clean edge (buy={}, sell={}). Standing aside instead of guessing on momentum.".format(
-                vote.get("buy_strategies"), vote.get("sell_strategies")),
-            "rejection_reason": "Multi-strategy confluence found no clean edge.",
-            "structural_score": 40, "score_reason": "Upgraded model declined the setup.", "candidate_direction": None,
-            "levels_source": "PYTHON", "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
-        }
-        
-    if regime.get("regime") == "RANGING" and reversal is None:
-        return {
-            "bias": "RANGING", "signal": "WAIT", "confluence_score": 40, "confidence": "LOW",
-            "dxy_correlation": "NEUTRAL", "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-                micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-            "reasoning": "No trade: Market is ranging/choppy (ADX {}) with no reversal trigger. Momentum entries here have negative expectancy.".format(regime.get("adx")),
-            "rejection_reason": "Market is ranging/choppy with no reversal trigger.",
-            "structural_score": 40, "score_reason": "Upgraded model declined the setup.", "candidate_direction": None,
-            "levels_source": "PYTHON", "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
-        }
-        
-    if htf_dir and direction != htf_dir and reversal is None:
-        return {
-            "bias": "RANGING", "signal": "WAIT", "confluence_score": 40, "confidence": "LOW",
-            "dxy_correlation": "NEUTRAL", "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-                micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-            "reasoning": "No trade: Proposed {} is counter to the higher-timeframe {} trend with no reversal confirmation. Declining countertrend chop.".format(direction, htf_dir),
-            "rejection_reason": "Counter-trend without reversal confirmation.",
-            "structural_score": 40, "score_reason": "Upgraded model declined the setup.", "candidate_direction": None,
-            "levels_source": "PYTHON", "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
-        }
-        
-    lock = _desk_position_lock(symbol, direction, current_price)
-    if lock:
-        return {
-            "bias": "RANGING", "signal": "WAIT", "confluence_score": 40, "confidence": "LOW",
-            "dxy_correlation": "NEUTRAL", "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-                micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-            "reasoning": "No trade: " + lock, "rejection_reason": lock,
-            "structural_score": 40, "score_reason": "Upgraded model declined the setup.", "candidate_direction": None,
-            "levels_source": "PYTHON", "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
-        }
-        
-    bias = "BULLISH" if direction == "BUY" else "BEARISH"
-    supporting = vote.get("buy_strategies") if direction == "BUY" else vote.get("sell_strategies")
-    parts = []
-    parts.append("Upgraded desk model: {} via multi-strategy confluence ({}).".format(
-        direction, ", ".join(supporting) if supporting else "structure"))
-    parts.append("Regime {} (ADX {}).".format(regime.get("regime"), regime.get("adx")))
-    if htf_dir:
-        parts.append("Higher-timeframe trend is {} and aligned.".format(htf_dir))
-    if reversal:
-        parts.append("Reversal candle {} confirms zone rejection.".format(reversal.get("type")))
-    parts.append("Microstructure: VWAP {}, RVOL {}, momentum {}.".format(
-        micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL")))
-    if historical_context:
-        parts.append("Price context: {}".format(historical_context))
-        
+    except Exception:
+        return {}
+
+def ema_trend(d, atr):
+    try:
+        close = pd.to_numeric(d['Close'], errors='coerce')
+        e21 = close.ewm(span=21, adjust=False).mean()
+        e50 = close.ewm(span=50, adjust=False).mean()
+        last = float(close.iloc[-1])
+        slope = float(e50.iloc[-1] - e50.iloc[-6]) / atr if len(e50) > 56 and atr else 0.0
+        if last > e21.iloc[-1] > e50.iloc[-1] and slope > 0:
+            state = 'BULLISH'
+        elif last < e21.iloc[-1] < e50.iloc[-1] and slope < 0:
+            state = 'BEARISH'
+        else:
+            state = 'NEUTRAL'
+        return {'state': state, 'e21': float(e21.iloc[-1]), 'e50': float(e50.iloc[-1]), 'slope_atr': round(slope, 2)}
+    except Exception:
+        return {'state': 'NEUTRAL', 'e21': None, 'e50': None, 'slope_atr': 0.0}
+
+# =============================================================================
+# ── V3 CORE: MARKET STRUCTURE ENGINE ────────────────────────────────────────
+# Confirmed pivots -> ATR-filtered zig-zag -> HH/HL/LH/LL classification ->
+# close-based BOS/CHOCH -> mitigation-aware order blocks & FVGs -> liquidity
+# pools -> dealing range. Everything works on CLOSED candles only.
+# =============================================================================
+def find_pivots(df, left=3, right=3):
+    highs = df['High'].to_numpy(dtype=float)
+    lows = df['Low'].to_numpy(dtype=float)
+    idx = df.index
+    out = []
+    for i in range(left, len(df) - right):
+        h = highs[i]
+        if h > highs[i - left:i].max() and h >= highs[i + 1:i + right + 1].max():
+            out.append({'i': i, 't': idx[i], 'price': float(h), 'type': 'H'})
+        l = lows[i]
+        if l < lows[i - left:i].min() and l <= lows[i + 1:i + right + 1].min():
+            out.append({'i': i, 't': idx[i], 'price': float(l), 'type': 'L'})
+    out.sort(key=lambda p: (p['i'], p['type']))
+    return out
+
+def _zigzag(pivots, min_leg):
+    """Force H/L alternation and drop legs smaller than `min_leg` (ATR-based significance)."""
+    out = []
+    for p in pivots:
+        if not out:
+            out.append(p)
+            continue
+        last = out[-1]
+        if p['type'] == last['type']:
+            if (p['type'] == 'H' and p['price'] >= last['price']) or (p['type'] == 'L' and p['price'] <= last['price']):
+                out[-1] = p
+            continue
+        if abs(p['price'] - last['price']) < min_leg:
+            continue
+        out.append(p)
+    return out
+
+def _mark_swept(d, pivots):
+    """A pivot high that later price has traded above is no longer live liquidity/resistance
+    (same for lows). Only un-swept pivots are valid SL anchors or TP targets."""
+    highs = d['High'].to_numpy(dtype=float)
+    lows = d['Low'].to_numpy(dtype=float)
+    for p in pivots:
+        after = slice(p['i'] + 1, len(d))
+        if p['type'] == 'H':
+            p['swept'] = bool(len(highs[after]) and highs[after].max() > p['price'])
+        else:
+            p['swept'] = bool(len(lows[after]) and lows[after].min() < p['price'])
+    return pivots
+
+def classify_structure(pivots):
+    highs = [p for p in pivots if p['type'] == 'H'][-3:]
+    lows = [p for p in pivots if p['type'] == 'L'][-3:]
+    if len(highs) < 2 or len(lows) < 2:
+        return 'RANGE', 'insufficient swings'
+    hh, lh = highs[-1]['price'] > highs[-2]['price'], highs[-1]['price'] < highs[-2]['price']
+    hl, ll = lows[-1]['price'] > lows[-2]['price'], lows[-1]['price'] < lows[-2]['price']
+    if hh and hl:
+        return 'BULLISH', 'HH + HL'
+    if lh and ll:
+        return 'BEARISH', 'LH + LL'
+    if hh and ll:
+        return 'RANGE', 'expanding range (HH + LL)'
+    if lh and hl:
+        return 'RANGE', 'contracting range (LH + HL)'
+    return 'RANGE', 'mixed swings'
+
+def detect_structure_breaks(d, pivots, right):
+    """Close-based BOS/CHOCH. A break only counts when a candle CLOSES beyond the last
+    confirmed swing (a wick through a level is a liquidity sweep, not a structure break).
+    BOS = break in the direction of the standing structure; CHOCH = break against it."""
+    closes = d['Close'].to_numpy(dtype=float)
+    n = len(d)
+    ordered = sorted(pivots, key=lambda p: p['i'])
+    pi = 0
+    swing_high = swing_low = None
+    state = None
+    events = []
+    for i in range(n):
+        while pi < len(ordered) and ordered[pi]['i'] + right <= i:
+            p = ordered[pi]
+            pi += 1
+            if p['type'] == 'H':
+                swing_high = {'price': p['price'], 'broken': False}
+            else:
+                swing_low = {'price': p['price'], 'broken': False}
+        if swing_high and not swing_high['broken'] and closes[i] > swing_high['price']:
+            kind = 'CHOCH' if state == 'BEARISH' else 'BOS'
+            events.append({'i': i, 't': d.index[i], 'dir': 'BULLISH', 'kind': kind, 'level': swing_high['price'], 'age': n - 1 - i})
+            state = 'BULLISH'
+            swing_high['broken'] = True
+        if swing_low and not swing_low['broken'] and closes[i] < swing_low['price']:
+            kind = 'CHOCH' if state == 'BULLISH' else 'BOS'
+            events.append({'i': i, 't': d.index[i], 'dir': 'BEARISH', 'kind': kind, 'level': swing_low['price'], 'age': n - 1 - i})
+            state = 'BEARISH'
+            swing_low['broken'] = True
+    return {'events': events[-5:], 'last': events[-1] if events else None, 'state': state}
+
+def _overlap_ratio(a_top, a_bottom, b_top, b_bottom):
+    inter = min(a_top, b_top) - max(a_bottom, b_bottom)
+    if inter <= 0:
+        return 0.0
+    return inter / max(1e-12, min(a_top - a_bottom, b_top - b_bottom))
+
+def find_order_blocks(d, atr, disp_atr=1.0, impulse_lookback=5, max_age=200, max_keep=6):
+    """Institutional order block: the last opposite-colour candle before a DISPLACEMENT candle
+    (body >= disp_atr * ATR) that closes beyond the prior `impulse_lookback` candles' extreme.
+    Mitigation-aware: a zone whose distal edge has been CLOSED through is dead and dropped; the
+    number of times price has re-entered it (`touches`) is tracked because tested zones are weaker.
+    The old detector only looked at the last 3 candles, so its 'order blocks' were just the most
+    recent candles — they moved every bar."""
+    o = d['Open'].to_numpy(dtype=float)
+    h = d['High'].to_numpy(dtype=float)
+    l = d['Low'].to_numpy(dtype=float)
+    c = d['Close'].to_numpy(dtype=float)
+    n = len(d)
+    zones = []
+    for i in range(max(impulse_lookback + 1, n - max_age), n):
+        body = abs(c[i] - o[i])
+        if body < disp_atr * atr:
+            continue
+        prev_hi = h[i - impulse_lookback:i].max()
+        prev_lo = l[i - impulse_lookback:i].min()
+        zone = None
+        if c[i] > o[i] and c[i] > prev_hi:
+            for k in range(i - 1, i - impulse_lookback - 1, -1):
+                if c[k] < o[k]:
+                    zone = {'type': 'BULLISH_OB', 'top': h[k], 'bottom': l[k], 'j': k}
+                    break
+        elif c[i] < o[i] and c[i] < prev_lo:
+            for k in range(i - 1, i - impulse_lookback - 1, -1):
+                if c[k] > o[k]:
+                    zone = {'type': 'BEARISH_OB', 'top': h[k], 'bottom': l[k], 'j': k}
+                    break
+        if zone is None:
+            continue
+        j = zone['j']
+        if (zone['top'] - zone['bottom']) > 2.0 * atr:  # oversized candle -> use its body only
+            zone['top'], zone['bottom'] = max(o[j], c[j]), min(o[j], c[j])
+        touches, inside, mitigated = 0, False, False
+        for k in range(i + 1, n):
+            if zone['type'] == 'BULLISH_OB':
+                if c[k] < zone['bottom']:
+                    mitigated = True
+                    break
+                if l[k] <= zone['top']:
+                    if not inside:
+                        touches += 1
+                    inside = True
+                else:
+                    inside = False
+            else:
+                if c[k] > zone['top']:
+                    mitigated = True
+                    break
+                if h[k] >= zone['bottom']:
+                    if not inside:
+                        touches += 1
+                    inside = True
+                else:
+                    inside = False
+        if mitigated or zone['top'] <= zone['bottom']:
+            continue
+        disp = body / atr
+        zones.append({
+            'type': zone['type'], 'top': float(zone['top']), 'bottom': float(zone['bottom']),
+            'mid': float((zone['top'] + zone['bottom']) / 2.0), 'touches': touches,
+            'strength': 'STRONG' if disp >= 2.0 else 'MODERATE', 'disp_atr': round(disp, 2),
+            'j': j, 't': d.index[j], 'age': n - 1 - j,
+        })
+    zones.sort(key=lambda z: z['j'], reverse=True)
+    kept = []
+    for z in zones:
+        if any(k['type'] == z['type'] and _overlap_ratio(z['top'], z['bottom'], k['top'], k['bottom']) > 0.5 for k in kept):
+            continue
+        kept.append(z)
+    return kept[:max_keep * 2]
+
+def find_fvgs(d, atr, min_gap_atr=0.25, max_age=200, max_keep=6):
+    """Three-candle imbalances that are still (at least partly) UNFILLED. The remaining
+    unfilled slice is what's returned as the zone."""
+    h = d['High'].to_numpy(dtype=float)
+    l = d['Low'].to_numpy(dtype=float)
+    c = d['Close'].to_numpy(dtype=float)
+    n = len(d)
+    out = []
+    for i in range(max(2, n - max_age), n):
+        if l[i] > h[i - 2] and (l[i] - h[i - 2]) >= min_gap_atr * atr:
+            bottom, top = float(h[i - 2]), float(l[i])
+            lowest = top
+            for k in range(i + 1, n):
+                lowest = min(lowest, l[k])
+                if lowest <= bottom:
+                    break
+            if lowest <= bottom:
+                continue
+            remaining_top = min(top, lowest)
+            if remaining_top - bottom < 0.1 * atr:
+                continue
+            out.append({'type': 'BULLISH_FVG', 'top': remaining_top, 'bottom': bottom, 'mid': (remaining_top + bottom) / 2.0,
+                        'touches': 1 if lowest < top else 0, 'i': i, 't': d.index[i], 'age': n - 1 - i})
+        elif h[i] < l[i - 2] and (l[i - 2] - h[i]) >= min_gap_atr * atr:
+            top, bottom = float(l[i - 2]), float(h[i])
+            highest = bottom
+            for k in range(i + 1, n):
+                highest = max(highest, h[k])
+                if highest >= top:
+                    break
+            if highest >= top:
+                continue
+            remaining_bottom = max(bottom, highest)
+            if top - remaining_bottom < 0.1 * atr:
+                continue
+            out.append({'type': 'BEARISH_FVG', 'top': top, 'bottom': remaining_bottom, 'mid': (top + remaining_bottom) / 2.0,
+                        'touches': 1 if highest > bottom else 0, 'i': i, 't': d.index[i], 'age': n - 1 - i})
+    out.sort(key=lambda z: z['i'], reverse=True)
+    return out[:max_keep * 2]
+
+def find_liquidity_pools(pivots, atr, tol_atr=0.2, max_pivots=10):
+    """Equal highs / equal lows (2+ un-swept pivots within tolerance) = resting stop liquidity."""
+    result = {'eqh': [], 'eql': []}
+    for ptype, key in (('H', 'eqh'), ('L', 'eql')):
+        pts = [p for p in pivots if p['type'] == ptype and not p.get('swept')][-max_pivots:]
+        used = set()
+        for a in range(len(pts)):
+            if a in used:
+                continue
+            group = [a]
+            for b in range(a + 1, len(pts)):
+                if b not in used and abs(pts[b]['price'] - pts[a]['price']) <= tol_atr * atr:
+                    group.append(b)
+            if len(group) >= 2:
+                used.update(group)
+                prices = [pts[g]['price'] for g in group]
+                result[key].append({'level': max(prices) if ptype == 'H' else min(prices), 'count': len(group)})
+    return result
+
+def dealing_range(d, pivots, atr):
+    highs = [p['price'] for p in pivots if p['type'] == 'H'][-2:]
+    lows = [p['price'] for p in pivots if p['type'] == 'L'][-2:]
+    if highs and lows:
+        hi, lo = max(highs), min(lows)
+    else:
+        hi, lo = float(d['High'].tail(100).max()), float(d['Low'].tail(100).min())
+    hi = max(hi, float(d['High'].tail(3).max()))
+    lo = min(lo, float(d['Low'].tail(3).min()))
+    if hi - lo < 2.0 * atr:
+        hi, lo = float(d['High'].tail(100).max()), float(d['Low'].tail(100).min())
+    rng = max(hi - lo, 1e-9)
     return {
-        "bias": bias, "signal": normalize_ai_signal(direction), "confluence_score": 76, "confidence": "MEDIUM",
-        "dxy_correlation": "CONFIRMING" if dxy_context else "NEUTRAL",
-        "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
-            micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL"), regime.get("adx")),
-        "reasoning": " ".join(parts), "rejection_reason": None,
-        "structural_score": 72, "score_reason": "Upgraded regime + multi-strategy confluence model.",
-        "candidate_direction": direction, "levels_source": "PYTHON",
-        "historical_pattern": historical_context or "", "api_status": "FALLBACK", "model_used": PYTHON_FALLBACK_MODEL
+        'high': float(hi), 'low': float(lo), 'eq': float((hi + lo) / 2.0),
+        'ote_buy': (float(hi - 0.79 * rng), float(hi - 0.62 * rng)),    # (bottom, top) retracement 62-79% from the high
+        'ote_sell': (float(lo + 0.62 * rng), float(lo + 0.79 * rng)),   # (bottom, top) retracement 62-79% from the low
     }
 
-def build_market_analysis_prompt():
-    return """You are an elite institutional trading desk AI. Use every data block below plus the attached chart screenshot if present. This desk runs strict top-down analysis: HIGHER TIMEFRAMES (H4/H1) decide direction; LOWER TIMEFRAMES (M15/M30/M10) ONLY time the exact limit-entry price. Never let LTF noise change your direction call.
-
-DATA SUMMARY:
-{data_summary}
-M10 MICROSTRUCTURE (fine-grained timing only):
-{microstructure_data}
-== HTF STRUCTURE (H4 macro + H1 primary) — THIS DECIDES BIAS / MARKET_STATE / SIGNAL ==
-{htf_structure}
-PYTHON DIRECTIONAL LEDGER (built on H1):
-{directional_ledger}
-STRUCTURAL SCORE (PYTHON, H1-based):
-{structural_score_context}
-FIRM DESK BIAS (HTF-first with hysteresis):
-{firm_bias}
-RSI VALUES (all timeframes):
-{rsi_values}
-RSI DIVERGENCE (H1 = bias signal, M15 = entry-timing signal):
-{rsi_context}
-VOLATILITY — TWO SEPARATE ATRs, DO NOT MIX THEM:
-{volatility_context}
-HTF CLOSES (H1/H4):
-{htf_context}
-DXY (US Dollar Index) TREND:
-{dxy_data}
-== LTF ENTRY TIMING (M15 primary + M30 confirm + M10 timing) — USE ONLY TO PICK THE EXACT LIMIT PRICE, NEVER TO CHANGE DIRECTION ==
-{ltf_structure}
-RECENT M10 PRICE ACTION:
-{historical_context}
-ENTRY GAP RULE (institutional limit-order band, hard-enforced in Python after you answer):
-{max_entry_distance}
-PYTHON CANDIDATE LIMIT-ENTRY PLANS (LTF entry + HTF-sized SL/TP — use as-is or refine):
-{candidate_levels}
-
-DECISION RULES:
-1. STEP ONE — DIRECTION (HTF ONLY): Read == HTF STRUCTURE ==, the H1-based PYTHON DIRECTIONAL LEDGER, the H1-based STRUCTURAL SCORE, and FIRM DESK BIAS. Decide market_state (continuation/reversal/exhaustion/trend/coiling) and signal (BUY or SELL — never WAIT, this desk always resolves to an executable trade) from these alone. Use H4 for the macro trend, H1 for the primary trend/structure/premium-discount, H1 RSI divergence, and DXY as a macro filter for XAUUSD/EURUSD/BTCUSD. Do not let anything in the LTF ENTRY TIMING section influence this decision — explain any override of FIRM DESK BIAS explicitly.
-2. STEP TWO — ENTRY (LTF ONLY, after direction is locked): Read == LTF ENTRY TIMING == and PYTHON CANDIDATE LIMIT-ENTRY PLANS. Select or refine a genuine M15/M30 pullback level (order block, FVG, swing, VWAP) that sits inside the ENTRY GAP RULE band. The live quote is never the entry. M10 timing confirms whether that pullback is actually happening now (momentum/VWAP/RVOL/last candle) — it does not pick the level or change direction.
-3. order_type is always "LIMIT": BUY LIMIT below the live quote, SELL LIMIT above it. An entry at or within a hair of live price is a disguised market order and will be rejected and rebuilt.
-4. Set exhaustion_target at the most realistic opposing HTF range/liquidity extreme the move can reach before stalling, measured FROM THE ENTRY. Use it as TP. Put SL beyond clear HTF structural invalidation with ATR room (use the HTF ATR, not the LTF one); never guarantee a target, and reject levels that violate minimum 1.5 R:R or maximum risk.
-5. Populate "next_level_watch": the next key HTF structural level beyond take_profit in the trade direction, with a one-line reason.
-6. Keep all numbers identical across entry, stop_loss, take_profit and order_description — reasoning must explain the SAME numbers you output, not a price you considered along the way.
-7. If the screenshot is usable, identify visible support, resistance, liquidity, trendlines and patterns in visual_levels; otherwise say unavailable.
-8. Be concise but specific: reasoning must state the HTF bias and its evidence first, then the LTF entry justification separately, then invalidation, target, risk. Complete valid JSON before adding detail — do not spend tokens narrating your thought process outside the JSON fields.
-
-OUTPUT STRICT JSON ONLY (NO MARKDOWN, NO CODE FENCES):
-{{
-"market_state": "continuation|reversal|exhaustion|trend|coiling",
-"bias": "BULLISH|BEARISH|RANGING",
-"signal": "BUY|SELL",
-"confluence_score": 0,
-"confidence": "HIGH|MEDIUM|LOW",
-"dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL",
-"htf_bias_basis": "1-2 sentences: H4/H1 structure and evidence that decided the direction (HTF ONLY)",
-"ltf_entry_basis": "1-2 sentences: the M15/M30 pullback level chosen/refined and why, plus M10 timing confirmation (LTF ONLY)",
-"microstructure_read": "Brief M10 VWAP/RVOL status and intrabar read",
-"directional_evidence": {{"bullish": ["item1","item2"], "bearish": ["item1","item2"]}},
-"visual_levels": "Describe key levels seen on the chart screenshot: support, resistance, liquidity pools, trendlines",
-"entry": 0.00,
-"stop_loss": 0.00,
-"take_profit": [0.00, 0.00],
-"exhaustion_target": 0.00,
-"rr_ratio": 0.00,
-"order_type": "LIMIT",
-"entry_anchor": "M15/M30 demand zone / swing low / FVG / VWAP",
-"stop_anchor": "H1/H4 swing low / OB / FVG / invalidation level",
-"tp_anchor": "H1/H4 exhaustion range extreme / swing high / supply zone / FVG",
-"next_level_watch": "Next key HTF structural level beyond TP and why price may approach it next",
-"order_expiry": "until next H1 close / until structure invalidates / GTC",
-"order_description": "Execution plan using SAME numbers as entry/stop_loss/take_profit.",
-"confluence_breakdown": "Weighting behind score: HTF structure, DXY, RSI, VWAP, RVOL, premium/discount, market phase.",
-"reasoning": "Concise analysis: HTF bias + evidence, LTF entry justification, invalidation, exhaustion target, risk.",
-"rejection_reason": ""
-}}"""
-
-def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='image/png'):
+def range_pos(rng, price):
     try:
-        data = all_data.get(symbol, {})
-        m10 = data.get('M10', pd.DataFrame())
-        h1 = data.get('H1', pd.DataFrame())
-        h4 = data.get('H4', pd.DataFrame())
-        live_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
-        if m10.empty:
-            return {"error": f"Failed to fetch market data for {symbol}. Yahoo Finance may be temporarily rate-limiting your IP. Please wait a few minutes and try again."}
+        span = rng['high'] - rng['low']
+        return (float(price) - rng['low']) / span if span > 0 else 0.5
+    except Exception:
+        return 0.5
 
-        refreshed_data = refresh_symbol_data_if_stale(
-            symbol, YFINANCE_MAP.get(symbol, symbol), live_snapshot, data
-        )
-        if refreshed_data is not data:
-            data = refreshed_data
+def classify_candles(d, lookback=10):
+    """Per-candle pattern read (STRONG_BULLISH/BEARISH, DOJI, REJECTION_HIGH/LOW, HAMMER/
+    INVERTED_HAMMER, SHOOTING_STAR/HANGING_MAN) over the last `lookback` CLOSED candles. Used
+    only as an LTF confirmation input (is a pullback actually reversing right now) — it has no
+    vote on HTF direction."""
+    if d is None or len(d) < 3:
+        return []
+    o = d['Open'].to_numpy(dtype=float)
+    h = d['High'].to_numpy(dtype=float)
+    l = d['Low'].to_numpy(dtype=float)
+    c = d['Close'].to_numpy(dtype=float)
+    n = len(d)
+    out = []
+    for i in range(max(0, n - lookback), n):
+        body = abs(c[i] - o[i])
+        rng = h[i] - l[i]
+        if rng <= 0:
+            continue
+        upper = h[i] - max(o[i], c[i])
+        lower = min(o[i], c[i]) - l[i]
+        body_ratio, upper_ratio, lower_ratio = body / rng, upper / rng, lower / rng
+        ctype = 'BULLISH' if c[i] > o[i] else 'BEARISH' if c[i] < o[i] else 'DOJI'
+        if body_ratio > 0.7 and ctype != 'DOJI':
+            pattern = 'STRONG_' + ctype
+        elif body_ratio < 0.3:
+            pattern = 'DOJI'
+        elif upper_ratio > 0.6:
+            pattern = 'REJECTION_HIGH'
+        elif lower_ratio > 0.6:
+            pattern = 'REJECTION_LOW'
+        elif upper_ratio > 0.4 and body_ratio < 0.4:
+            pattern = 'SHOOTING_STAR' if ctype == 'BEARISH' else 'HANGING_MAN'
+        elif lower_ratio > 0.4 and body_ratio < 0.4:
+            pattern = 'HAMMER' if ctype == 'BULLISH' else 'INVERTED_HAMMER'
+        else:
+            pattern = 'NORMAL'
+        out.append({'t': d.index[i], 'type': ctype, 'pattern': pattern,
+                    'body_ratio': round(body_ratio, 2), 'upper_wick_ratio': round(upper_ratio, 2),
+                    'lower_wick_ratio': round(lower_ratio, 2), 'close': float(c[i])})
+    return out
+
+def candle_pattern_signal(direction, candles, max_pts=2.0):
+    """Does the most recent CLOSED candle actually support this direction right now? Wick-ratio
+    based (robust) with the named pattern kept for the human-readable explanation. Returns a
+    score in [0, max_pts] plus a one-line detail string for transparency in the reasoning/notes."""
+    if not candles:
+        return {'score': max_pts * 0.4, 'detail': None}
+    last = candles[-1]
+    buy = direction == 'BUY'
+    wick_support = last['lower_wick_ratio'] if buy else last['upper_wick_ratio']
+    wick_oppose = last['upper_wick_ratio'] if buy else last['lower_wick_ratio']
+    strong_support = last['pattern'] == ('STRONG_BULLISH' if buy else 'STRONG_BEARISH')
+    strong_oppose = last['pattern'] == ('STRONG_BEARISH' if buy else 'STRONG_BULLISH')
+    if strong_support or wick_support >= 0.5:
+        return {'score': max_pts, 'detail': f"last candle {last['pattern']} supports {direction} (wick {wick_support:.0%})"}
+    if strong_oppose or wick_oppose >= 0.5:
+        return {'score': 0.0, 'detail': f"last candle {last['pattern']} contradicts {direction} (wick {wick_oppose:.0%})"}
+    return {'score': max_pts * 0.4, 'detail': f"last candle {last['pattern']} is neutral"}
+
+def analyze_structure(df, label, left=3, right=3, leg_atr=1.0, ob_disp_atr=1.0, fvg_min_atr=0.25, liq_tol_atr=0.2):
+    """One consistent structural snapshot for a timeframe, built from CLOSED candles only."""
+    d = closed_candles(df)
+    if d is None or len(d) < 40:
+        return None
+    try:
+        d = d.tail(600).copy()
+        atr = calculate_atr(d)
+        if not atr or atr <= 0:
+            return None
+        piv = _zigzag(find_pivots(d, left, right), atr * leg_atr)
+        piv = _mark_swept(d, piv)
+        trend, pattern = classify_structure(piv)
+        breaks = detect_structure_breaks(d, piv, right)
+        return {
+            'label': label, 'df': d, 'atr': atr, 'close': float(d['Close'].iloc[-1]),
+            'pivots': piv, 'trend': trend, 'pattern': pattern, 'breaks': breaks,
+            'order_blocks': find_order_blocks(d, atr, disp_atr=ob_disp_atr),
+            'fvgs': find_fvgs(d, atr, min_gap_atr=fvg_min_atr),
+            'liquidity': find_liquidity_pools(piv, atr, tol_atr=liq_tol_atr),
+            'ema': ema_trend(d, atr),
+            'rsi': compute_rsi_last(d['Close']),
+            'range': dealing_range(d, piv, atr),
+            'micro': calculate_microstructure(d),
+            'candles': classify_candles(d),
+        }
+    except Exception as exc:
+        print(f"⚠️ analyze_structure({label}) failed: {exc}")
+        traceback.print_exc()
+        return None
+
+def prior_period_levels(h1_df):
+    """Previous-day and previous-week high/low from H1 — the levels the market reliably reacts to."""
+    levels = {}
+    try:
+        d = closed_candles(h1_df)
+        if d is None or len(d) < 30:
+            return levels
+        idx = d.index.tz_convert('UTC') if d.index.tz is not None else d.index.tz_localize('UTC')
+        days = d.groupby(idx.normalize())
+        keys = sorted(days.groups.keys())
+        if len(keys) >= 2:
+            prev = days.get_group(keys[-2])
+            levels['PDH'], levels['PDL'] = float(prev['High'].max()), float(prev['Low'].min())
+        weeks = d.groupby(idx.tz_localize(None).to_period('W'))
+        wkeys = sorted(weeks.groups.keys())
+        if len(wkeys) >= 2:
+            prev = weeks.get_group(wkeys[-2])
+            levels['PWH'], levels['PWL'] = float(prev['High'].max()), float(prev['Low'].min())
+    except Exception as exc:
+        print(f"⚠️ prior_period_levels failed: {exc}")
+    return levels
+
+def compute_dxy_context(all_data):
+    """DXY direction from H1 + H4 EMA trend (replaces the cumulative-VWAP read)."""
+    try:
+        dxy = all_data.get('DXY', {}) or {}
+        h1 = closed_candles(dxy.get('H1'))
+        h4 = closed_candles(ensure_h4(dxy.get('H1'), dxy.get('H4')))
+        states = []
+        for frame in (h1, h4):
+            if frame is not None and not frame.empty and len(frame) >= 60:
+                states.append(ema_trend(frame, calculate_atr(frame) or 1.0)['state'])
+        if not states:
+            return {'direction': 'NEUTRAL', 'detail': 'DXY data unavailable'}
+        if all(s == 'BULLISH' for s in states):
+            direction = 'BULLISH'
+        elif all(s == 'BEARISH' for s in states):
+            direction = 'BEARISH'
+        else:
+            direction = 'NEUTRAL'
+        last = float(h1['Close'].iloc[-1]) if h1 is not None and not h1.empty else None
+        return {'direction': direction, 'detail': f"DXY last {last} | H1/H4 EMA trend: {', '.join(states)}"}
+    except Exception:
+        return {'direction': 'NEUTRAL', 'detail': 'DXY data unavailable'}
+
+def dxy_relation(symbol, direction, dxy):
+    if symbol not in ('XAUUSD', 'EURUSD', 'BTCUSD') or not dxy:
+        return 'NEUTRAL'
+    d = dxy.get('direction')
+    if d == 'NEUTRAL':
+        return 'NEUTRAL'
+    supportive = (direction == 'BUY' and d == 'BEARISH') or (direction == 'SELL' and d == 'BULLISH')
+    return 'CONFIRMING' if supportive else 'CONTRADICTING'
+
+
+# =============================================================================
+# ── V3 CORE: PAIR CONFIG ────────────────────────────────────────────────────
+# =============================================================================
+def get_pair_config(symbol):
+    """Entry band, stop and target rules are now sized from the H1 ATR (the timeframe the thesis
+    lives on). The old band (max ~0.85% / 450pts on BTC, 0.9 ATR of M15) rejected almost every
+    genuine HTF zone and pushed entries onto whatever M15 candle had just printed."""
+    base = {
+        'digits': 2, 'tick_size': 0.01,
+        'min_rr': 1.5, 'max_rr': 4.0,
+        'htf_min_gap_atr': 0.15, 'htf_max_gap_atr': 3.0, 'htf_max_gap_pct': 0.012,
+        'min_stop_atr': 0.8, 'max_stop_atr': 3.0, 'max_risk_pct': 0.012,
+        'stop_buffer_atr': 0.30, 'tp_buffer_atr': 0.15,
+        'plan_expiry_hours': 18,
+        'ob_disp_atr': 1.0, 'fvg_min_atr': 0.25, 'liq_tol_atr': 0.2,
+        'default_pullback_atr': 0.6, 'min_dist_pct': 0.0015,
+        'score_floor': MINIMUM_CONFLUENCE_SCORE,
+    }
+    overrides = {
+        'XAUUSD': {'htf_max_gap_pct': 0.012, 'max_risk_pct': 0.012},
+        'EURUSD': {'digits': 5, 'tick_size': 0.00001, 'htf_max_gap_pct': 0.007, 'max_risk_pct': 0.006, 'min_dist_pct': 0.0008},
+        'BTCUSD': {'htf_max_gap_pct': 0.025, 'max_risk_pct': 0.03},
+        'US30': {'digits': 1, 'tick_size': 0.1, 'htf_max_gap_pct': 0.012, 'max_risk_pct': 0.012},
+    }
+    return {**base, **overrides.get(symbol, {})}
+
+def htf_entry_gap_bounds(price, atr_h1, cfg):
+    min_gap = max(float(cfg['tick_size']) * 5.0, float(atr_h1) * float(cfg['htf_min_gap_atr']), float(price) * 0.0002)
+    max_gap = min(float(atr_h1) * float(cfg['htf_max_gap_atr']), float(price) * float(cfg['htf_max_gap_pct']))
+    if max_gap <= min_gap:
+        max_gap = min_gap * 3.0
+    return min_gap, max_gap
+
+def compute_fallback_atr_plan_levels(direction, price, atr_h1, cfg):
+    """Only used when NO structural plan is valid. Always low-scored, never pushed to Telegram."""
+    min_gap, max_gap = htf_entry_gap_bounds(price, atr_h1, cfg)
+    gap = min(max(atr_h1 * float(cfg['default_pullback_atr']), min_gap), max_gap)
+    entry = price - gap if direction == 'BUY' else price + gap
+    return entry
+
+# =============================================================================
+# ── V3 CORE: HTF BIAS (H4 + H1 ONLY) WITH PERSISTENT HYSTERESIS ─────────────
+# The LTFs (M10/M15/M30) have NO vote in direction any more. The old MTF score gave M10/M15/M30
+# a combined weight of 3.5 vs 5.0 for H1/H4, so ten-minute noise regularly out-voted the
+# structure that actually matters — that is how a BUY at 20:53 became a SELL at 00:03.
+# =============================================================================
+def _snap_bias_score(snap):
+    """-100..+100 directional score for one HTF snapshot, plus the evidence behind it."""
+    if not snap:
+        return 0.0, []
+    label = snap['label']
+    score, notes = 0.0, []
+    if snap['trend'] == 'BULLISH':
+        score += 20
+        notes.append(f"{label} structure {snap['pattern']}")
+    elif snap['trend'] == 'BEARISH':
+        score -= 20
+        notes.append(f"{label} structure {snap['pattern']}")
+    else:
+        notes.append(f"{label} structure ranging ({snap['pattern']})")
+    state = snap['breaks']['state']
+    if state == 'BULLISH':
+        score += 14
+    elif state == 'BEARISH':
+        score -= 14
+    last = snap['breaks']['last']
+    if last:
+        notes.append(f"{label} last close-based break: {last['kind']} {last['dir'].lower()} at {last['level']:.5g} ({last['age']} bars ago)")
+        if last['kind'] == 'CHOCH' and last['age'] <= 24:
+            score += 6 if last['dir'] == 'BULLISH' else -6
+    ema_state = snap['ema']['state']
+    if ema_state == 'BULLISH':
+        score += 12
+        notes.append(f"{label} price>EMA21>EMA50")
+    elif ema_state == 'BEARISH':
+        score -= 12
+        notes.append(f"{label} price<EMA21<EMA50")
+    rsi = snap.get('rsi')
+    if rsi is not None:
+        if rsi > 55:
+            score += 6
+        elif rsi < 45:
+            score -= 6
+        notes.append(f"{label} RSI {rsi}")
+    return score / 58.0 * 100.0, notes
+
+def _opposing_break_since(snaps, dir_word, since):
+    for label in ('H1', 'H4'):
+        snap = snaps.get(label)
+        last = ((snap or {}).get('breaks') or {}).get('last')
+        if last and last['dir'] == dir_word:
+            ts = parse_ts(last['t'])
+            if ts is not None and since is not None and ts > since:
+                return f"{label} {last['kind']} ({dir_word.lower()})"
+    return None
+
+def resolve_htf_bias(symbol, snaps, dxy, persist=True):
+    h4, h1 = snaps.get('H4'), snaps.get('H1')
+    s4, n4 = _snap_bias_score(h4)
+    s1, n1 = _snap_bias_score(h1)
+    if h4 and h1:
+        agg = (1.5 * s4 + 1.0 * s1) / 2.5
+    elif h1:
+        agg = s1
+    elif h4:
+        agg = s4
+    else:
+        agg = 0.0
+    dxy_adj = 0.0
+    if symbol in ('XAUUSD', 'EURUSD', 'BTCUSD') and dxy:
+        dxy_adj = -6.0 if dxy.get('direction') == 'BULLISH' else (6.0 if dxy.get('direction') == 'BEARISH' else 0.0)
+    agg = max(-100.0, min(100.0, agg + dxy_adj))
+    raw = 'BUY' if agg >= BIAS_DIRECTIONAL_THRESHOLD else ('SELL' if agg <= -BIAS_DIRECTIONAL_THRESHOLD else None)
+    aligned = bool(h4 and h1 and s4 * s1 > 0 and abs(s4) >= 20 and abs(s1) >= 20)
+
+    state = load_state()
+    prev = state['bias'].get(symbol)
+    now = utc_now()
+    notes = []
+    held = False
+    low_conviction = False
+    direction = None
+    since = now
+    if prev and prev.get('direction') in ('BUY', 'SELL'):
+        prev_since = parse_ts(prev.get('since')) or now
+        hours = (now - prev_since).total_seconds() / 3600.0
+        since = prev_since
+        if raw is None:
+            direction, held = prev['direction'], True
+            notes.append(f"HTF read is mixed ({agg:+.0f}); holding the standing {prev['direction']} bias set {prev_since.strftime('%d %b %H:%M')} UTC")
+        elif raw == prev['direction']:
+            direction = raw
+        else:
+            dir_word = 'BULLISH' if raw == 'BUY' else 'BEARISH'
+            evidence = _opposing_break_since(snaps, dir_word, prev_since)
+            if abs(agg) >= BIAS_FLIP_THRESHOLD and evidence and hours >= BIAS_MIN_HOLD_HOURS:
+                direction, since = raw, now
+                notes.append(f"BIAS FLIPPED {prev['direction']} -> {raw}: score {agg:+.0f} and {evidence}")
+            else:
+                direction, held = prev['direction'], True
+                why = []
+                if abs(agg) < BIAS_FLIP_THRESHOLD:
+                    why.append(f"score {agg:+.0f} is short of the ±{BIAS_FLIP_THRESHOLD:.0f} flip threshold")
+                if not evidence:
+                    why.append('no opposing H1/H4 close-based structure break yet')
+                if hours < BIAS_MIN_HOLD_HOURS:
+                    why.append(f"bias is only {hours:.1f}h old (minimum {BIAS_MIN_HOLD_HOURS:.0f}h)")
+                notes.append(f"Opposing {raw} read rejected as noise ({'; '.join(why)}) - standing {direction} bias retained")
+    else:
+        if raw:
+            direction = raw
+        else:
+            low_conviction = True
+            if abs(s4) > 1e-9:
+                direction = 'BUY' if s4 > 0 else 'SELL'
+                notes.append('HTF mixed; tie-broken by the H4 macro read (low conviction)')
+            elif abs(s1) > 1e-9:
+                direction = 'BUY' if s1 > 0 else 'SELL'
+                notes.append('HTF mixed; tie-broken by the H1 read (low conviction)')
+            else:
+                ref = (h4 or h1 or {}).get('range')
+                pos = range_pos(ref, (h1 or h4)['close']) if ref else 0.5
+                direction = 'SELL' if pos >= 0.5 else 'BUY'
+                notes.append('HTF flat; tie-broken by premium/discount location (low conviction)')
+    if direction is None:
+        direction = 'BUY'
+    if persist and direction:
+        state['bias'][symbol] = {'direction': direction, 'since': since.isoformat(), 'score': round(agg, 1), 'updated': now.isoformat()}
+    return {
+        'direction': direction, 'raw_direction': raw, 'score': round(agg, 1),
+        'h4_score': round(s4, 1), 'h1_score': round(s1, 1), 'aligned': aligned, 'held': held,
+        'low_conviction': low_conviction, 'since': since.isoformat(), 'dxy_adj': dxy_adj,
+        'evidence': n4 + n1, 'notes': notes,
+        'word': 'BULLISH' if direction == 'BUY' else 'BEARISH',
+    }
+
+# =============================================================================
+# ── V3 CORE: HTF ENTRY ZONES -> BEST LIMIT PRICE ────────────────────────────
+# =============================================================================
+def _zone(kind, tf, top, bottom, weight, touches=0):
+    top, bottom = float(max(top, bottom)), float(min(top, bottom))
+    return {'kind': kind, 'tf': tf, 'top': top, 'bottom': bottom, 'mid': (top + bottom) / 2.0,
+            'weight': float(weight), 'touches': int(touches)}
+
+def collect_entry_zones(direction, snaps, levels, atr_h1, cfg):
+    """Every HTF point of interest on the correct side of price that a limit order could rest in."""
+    buy = direction == 'BUY'
+    want_ob = 'BULLISH_OB' if buy else 'BEARISH_OB'
+    want_fvg = 'BULLISH_FVG' if buy else 'BEARISH_FVG'
+    word = 'demand' if buy else 'supply'
+    zones = []
+    for label, tfw in (('H4', 3.0), ('H1', 2.0)):
+        snap = snaps.get(label)
+        if not snap:
+            continue
+        for ob in snap['order_blocks']:
+            if ob['type'] == want_ob:
+                w = tfw * (1.25 if ob['strength'] == 'STRONG' else 1.0)
+                zones.append(_zone(f"{label} {word} OB", label, ob['top'], ob['bottom'], w, ob['touches']))
+        for fvg in snap['fvgs']:
+            if fvg['type'] == want_fvg:
+                zones.append(_zone(f"{label} FVG", label, fvg['top'], fvg['bottom'], tfw * 0.75, fvg['touches']))
+        lo, hi = snap['range']['ote_buy'] if buy else snap['range']['ote_sell']
+        zones.append(_zone(f"{label} OTE 62-79%", label, hi, lo, tfw * 0.7, 0))
+        want_type = 'L' if buy else 'H'
+        live = [p for p in snap['pivots'] if p['type'] == want_type and not p.get('swept')][-3:]
+        for p in live:
+            zones.append(_zone(f"{label} swing {'low' if buy else 'high'}", label, p['price'] + 0.15 * atr_h1, p['price'] - 0.15 * atr_h1, tfw * 0.5, 0))
+        pool_key = 'eql' if buy else 'eqh'
+        for pool in snap['liquidity'][pool_key][-2:]:
+            zones.append(_zone(f"{label} equal {'lows' if buy else 'highs'} x{pool['count']}", label,
+                               pool['level'] + 0.10 * atr_h1, pool['level'] - 0.25 * atr_h1, tfw * 0.5 + 0.4 * pool['count'], 0))
+    for key, w in (('PDL' if buy else 'PDH', 1.0), ('PWL' if buy else 'PWH', 1.3)):
+        if key in levels:
+            zones.append(_zone(f"{key} liquidity", 'H1', levels[key] + 0.10 * atr_h1, levels[key] - 0.25 * atr_h1, w, 0))
+    return zones
+
+def _entry_point_in_zone(direction, zone, price, min_gap):
+    """Mean-threshold (50%) of the zone, pulled inside the zone/gap rules when price is close."""
+    entry = zone['mid']
+    if direction == 'BUY':
+        if entry > price - min_gap:
+            entry = min(zone['top'], price - min_gap)
+            if entry < zone['bottom']:
+                return None
+    else:
+        if entry < price + min_gap:
+            entry = max(zone['bottom'], price + min_gap)
+            if entry > zone['top']:
+                return None
+    return float(entry)
+
+def rank_entry_zones(direction, price, zones, snaps, atr_h1, cfg):
+    min_gap, max_gap = htf_entry_gap_bounds(price, atr_h1, cfg)
+    buy = direction == 'BUY'
+    ref = (snaps.get('H4') or snaps.get('H1'))['range']
+    ranked = []
+    for z in zones:
+        entry = _entry_point_in_zone(direction, z, price, min_gap)
+        if entry is None:
+            continue
+        dist = (price - entry) if buy else (entry - price)
+        if dist < min_gap * 0.999 or dist > max_gap:
+            continue
+        overlaps = [o for o in zones if o is not z and _overlap_or_near(z, o, 0.25 * atr_h1)]
+        conf_w = sum(o['weight'] for o in overlaps) * 0.5
+        fresh = 1.0 if z['touches'] == 0 else (0.8 if z['touches'] == 1 else 0.55)
+        pos = range_pos(ref, entry)
+        location_bonus = 0.0
+        if (buy and pos <= 0.5) or ((not buy) and pos >= 0.5):
+            location_bonus += 1.5
+        lo, hi = ref['ote_buy'] if buy else ref['ote_sell']
+        if lo - 0.1 * atr_h1 <= entry <= hi + 0.1 * atr_h1:
+            location_bonus += 1.0
+        dist_atr = dist / atr_h1 if atr_h1 else 0.0
+        penalty = 0.6 * max(0.0, dist_atr - 1.0)
+        total = (z['weight'] + conf_w) * fresh + location_bonus - penalty
+        ranked.append({**z, 'entry': float(entry), 'dist': float(dist), 'dist_atr': round(dist_atr, 2),
+                       'confluence': sorted({o['kind'] for o in overlaps}), 'zone_score': round(total, 2),
+                       'range_pos': round(pos, 2)})
+    ranked.sort(key=lambda r: r['zone_score'], reverse=True)
+    dedup = []
+    for r in ranked:
+        if any(abs(r['entry'] - k['entry']) < 0.2 * atr_h1 for k in dedup):
+            continue
+        dedup.append(r)
+    return dedup
+
+def _overlap_or_near(a, b, tol):
+    return (a['bottom'] - tol) <= b['top'] and (b['bottom'] - tol) <= a['top']
+
+def refine_entry_with_ltf(direction, zone, ltf_snaps, atr_h1, price, min_gap):
+    """Inside the chosen HTF zone, snap the limit to a genuine M30/M15 level (OB/FVG/swing) if one
+    exists — the 'compare HTF entry with LTF' step. LTF can only refine WITHIN the zone; it can't
+    move the order outside it."""
+    lo, hi = zone['bottom'], zone['top']
+    tol = 0.1 * atr_h1
+    buy = direction == 'BUY'
+    want_ob = 'BULLISH_OB' if buy else 'BEARISH_OB'
+    want_fvg = 'BULLISH_FVG' if buy else 'BEARISH_FVG'
+    want_piv = 'L' if buy else 'H'
+    cands = []
+    for label, snap in ltf_snaps:
+        if not snap:
+            continue
+        for ob in snap['order_blocks']:
+            if ob['type'] == want_ob and ob['bottom'] <= hi + tol and ob['top'] >= lo - tol:
+                cands.append((min(max(ob['mid'], lo), hi), f"{label} OB"))
+        for fvg in snap['fvgs']:
+            if fvg['type'] == want_fvg and fvg['bottom'] <= hi + tol and fvg['top'] >= lo - tol:
+                cands.append((min(max(fvg['mid'], lo), hi), f"{label} FVG"))
+        for p in snap['pivots']:
+            if p['type'] == want_piv and not p.get('swept') and lo - tol <= p['price'] <= hi + tol:
+                cands.append((min(max(p['price'], lo), hi), f"{label} swing"))
+    if not cands:
+        return None, []
+    ref_price, _ = min(cands, key=lambda c: abs(c[0] - zone['mid']))
+    dist = (price - ref_price) if buy else (ref_price - price)
+    if dist < min_gap:
+        return None, []
+    near = sorted({name for p, name in cands if abs(p - ref_price) <= 0.15 * atr_h1})
+    return float(ref_price), near
+
+def collect_targets(direction, entry, snaps, levels, atr_h1):
+    """Opposing HTF liquidity/zones ahead of entry, nearest first."""
+    buy = direction == 'BUY'
+    out = []
+    for label in ('H1', 'H4'):
+        snap = snaps.get(label)
+        if not snap:
+            continue
+        for ob in snap['order_blocks']:
+            if buy and ob['type'] == 'BEARISH_OB' and ob['bottom'] > entry:
+                out.append({'price': ob['bottom'], 'kind': f"{label} supply OB"})
+            if (not buy) and ob['type'] == 'BULLISH_OB' and ob['top'] < entry:
+                out.append({'price': ob['top'], 'kind': f"{label} demand OB"})
+        for fvg in snap['fvgs']:
+            if buy and fvg['type'] == 'BEARISH_FVG' and fvg['bottom'] > entry:
+                out.append({'price': fvg['bottom'], 'kind': f"{label} bearish FVG"})
+            if (not buy) and fvg['type'] == 'BULLISH_FVG' and fvg['top'] < entry:
+                out.append({'price': fvg['top'], 'kind': f"{label} bullish FVG"})
+        for p in snap['pivots']:
+            if p.get('swept'):
+                continue
+            if buy and p['type'] == 'H' and p['price'] > entry:
+                out.append({'price': p['price'], 'kind': f"{label} swing high"})
+            if (not buy) and p['type'] == 'L' and p['price'] < entry:
+                out.append({'price': p['price'], 'kind': f"{label} swing low"})
+        pool = snap['liquidity']['eqh' if buy else 'eql']
+        for item in pool:
+            if (buy and item['level'] > entry) or ((not buy) and item['level'] < entry):
+                out.append({'price': item['level'], 'kind': f"{label} equal {'highs' if buy else 'lows'}"})
+        rng = snap['range']
+        edge = rng['high'] if buy else rng['low']
+        if (buy and edge > entry) or ((not buy) and edge < entry):
+            out.append({'price': edge, 'kind': f"{label} range {'high' if buy else 'low'}"})
+    for key in (('PDH', 'PWH') if buy else ('PDL', 'PWL')):
+        if key in levels and ((buy and levels[key] > entry) or ((not buy) and levels[key] < entry)):
+            out.append({'price': levels[key], 'kind': key})
+    out.sort(key=lambda t: abs(t['price'] - entry))
+    merged = []
+    for t in out:
+        if merged and abs(t['price'] - merged[-1]['price']) < 0.2 * atr_h1:
+            if t['kind'] not in merged[-1]['kind']:
+                merged[-1]['kind'] += f" + {t['kind']}"
+            continue
+        merged.append(dict(t))
+    return merged
+
+def build_plan_for_entry(direction, entry, zone, snaps, levels, atr_h1, cfg, ltf_names=None):
+    """SL beyond the zone's distal edge (and any live H1/H4 swing just beyond it) + ATR buffer;
+    TP1 = first opposing HTF level that pays >= min_rr; TP2 = the next one."""
+    buy = direction == 'BUY'
+    tick = float(cfg['tick_size'])
+    buffer = max(atr_h1 * float(cfg['stop_buffer_atr']), tick * 3.0)
+    tp_buffer = max(atr_h1 * float(cfg['tp_buffer_atr']), tick * 2.0)
+    min_risk = max(entry * float(cfg['min_dist_pct']), atr_h1 * float(cfg['min_stop_atr']))
+    max_risk = min(entry * float(cfg['max_risk_pct']), atr_h1 * float(cfg['max_stop_atr']))
+    if max_risk < min_risk:
+        max_risk = min_risk * 1.5
+    anchor = min(zone['bottom'], entry) if buy else max(zone['top'], entry)
+    anchor_note = f"{zone['kind']} distal edge"
+    want_type = 'L' if buy else 'H'
+    near = []
+    for label in ('H1', 'H4'):
+        snap = snaps.get(label)
+        for p in ((snap or {}).get('pivots') or []):
+            if p['type'] == want_type and not p.get('swept'):
+                if buy and anchor - 0.6 * atr_h1 <= p['price'] < anchor:
+                    near.append(p['price'])
+                if (not buy) and anchor < p['price'] <= anchor + 0.6 * atr_h1:
+                    near.append(p['price'])
+    if near:
+        anchor = min(near) if buy else max(near)
+        anchor_note = f"live H1/H4 swing {'low' if buy else 'high'} just beyond the zone"
+    sl = anchor - buffer if buy else anchor + buffer
+    risk = (entry - sl) if buy else (sl - entry)
+    if risk < min_risk:
+        sl = entry - min_risk if buy else entry + min_risk
+        risk = min_risk
+        anchor_note += ' (widened to the minimum HTF-ATR stop)'
+    if risk > max_risk:
+        return None, f"stop needs {risk:.5g} risk, above the {max_risk:.5g} cap"
+    targets = collect_targets(direction, entry, snaps, levels, atr_h1)
+    min_rr, max_rr = float(cfg['min_rr']), float(cfg['max_rr'])
+    tp1 = tp1_kind = tp2 = tp2_kind = None
+    idx_used = None
+    for n, t in enumerate(targets):
+        price = t['price'] - tp_buffer if buy else t['price'] + tp_buffer
+        reward = (price - entry) if buy else (entry - price)
+        if reward / risk >= min_rr:
+            tp1, tp1_kind, idx_used = price, t['kind'], n
+            break
+    tp_structural = True
+    if tp1 is None:
+        reward = risk * min_rr * 1.15
+        tp1 = entry + reward if buy else entry - reward
+        tp1_kind, tp_structural = 'RR projection (no HTF level pays the minimum R:R)', False
+    else:
+        rr1 = abs(tp1 - entry) / risk
+        if rr1 > max_rr:
+            tp1 = entry + risk * max_rr if buy else entry - risk * max_rr
+            tp1_kind += ' (capped at max R:R)'
+    tp2_structural = False
+    if idx_used is not None:
+        for t in targets[idx_used + 1:]:
+            price = t['price'] - tp_buffer if buy else t['price'] + tp_buffer
+            if (buy and price > tp1 + 0.2 * atr_h1) or ((not buy) and price < tp1 - 0.2 * atr_h1):
+                tp2, tp2_kind, tp2_structural = price, t['kind'], True
+                break
+    if tp2 is None:
+        extra = risk * max(abs(tp1 - entry) / risk + 1.0, 3.0)
+        extra = min(extra, risk * (max_rr + 1.0))
+        tp2 = entry + extra if buy else entry - extra
+        tp2_kind = 'R-multiple projection'
+    rr = abs(tp1 - entry) / risk
+    plan = {
+        'direction': direction,
+        'entry': round_price(entry, cfg), 'stop_loss': round_price(sl, cfg),
+        'take_profit': [round_price(tp1, cfg), round_price(tp2, cfg)],
+        'rr_ratio': round(rr, 2), 'risk': float(risk),
+        'sl_anchor': anchor_note, 'tp1_kind': tp1_kind, 'tp2_kind': tp2_kind,
+        'tp1_structural': tp_structural, 'tp2_structural': tp2_structural,
+        'ltf_refs': ltf_names or [],
+        'order_type': 'LIMIT',
+    }
+    return plan, 'ok'
+
+def score_plan(direction, plan, zone, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1):
+    """100-point transparent score. Every component is reported so a low score is explainable."""
+    buy = direction == 'BUY'
+    b = {}
+    dir_norm = bias['score'] if buy else -bias['score']
+    align = 25.0 * max(0.0, min(1.0, dir_norm / 60.0))
+    if not bias['aligned']:
+        align *= 0.7
+    if bias['held']:
+        align *= 0.6
+    if bias['low_conviction']:
+        align *= 0.4
+    b['HTF alignment (H4+H1)'] = round(align, 1)
+    b['Zone quality & confluence'] = round(min(25.0, zone.get('zone_score', 0) * 4.0), 1)
+    ref = (snaps.get('H4') or snaps.get('H1'))['range']
+    pos = range_pos(ref, plan['entry'])
+    depth = pos if buy else 1.0 - pos
+    b['Premium/discount location'] = 15.0 if depth <= 0.35 else 11.0 if depth <= 0.5 else 6.0 if depth <= 0.62 else 2.0
+    ltf = 0.0
+    candle_notes = []
+    if plan.get('ltf_refs'):
+        ltf += 4.0
+    m15 = next((s for lbl, s in ltf_snaps if lbl == 'M15' and s), None)
+    if m15:
+        e21 = m15['ema'].get('e21')
+        if e21 is not None:
+            pulling = (m15['close'] < e21) if buy else (m15['close'] > e21)
+            if pulling and abs(price - plan['entry']) <= 2.0 * atr_h1:
+                ltf += 2.0
+        rv = (m15.get('micro') or {}).get('rvol', 1.0)
+        if rv <= 2.5:
+            ltf += 1.0
+        m15_cp = candle_pattern_signal(direction, m15.get('candles'), max_pts=2.0)
+        ltf += m15_cp['score']
+        if m15_cp['detail']:
+            candle_notes.append(f"M15 {m15_cp['detail']}")
+    m10_candles = snaps.get('_candles_m10')
+    if m10_candles:
+        m10_cp = candle_pattern_signal(direction, m10_candles, max_pts=1.0)
+        ltf += m10_cp['score']
+        if m10_cp['detail']:
+            candle_notes.append(f"M10 {m10_cp['detail']}")
+    b['LTF confirmation'] = round(min(10.0, ltf), 1)
+    b['Risk:reward'] = round(min(10.0, 4.0 + max(0.0, plan['rr_ratio'] - 1.5) * 4.0), 1)
+    macro = {'CONFIRMING': 5.0, 'NEUTRAL': 3.0, 'CONTRADICTING': 0.0}.get(dxy_rel, 3.0)
+    reg = (regime or {}).get('regime')
+    want_mom = 'BULLISH' if buy else 'BEARISH'
+    if reg == 'TRENDING':
+        macro += 5.0 if (regime or {}).get('trend_direction') == want_mom else 1.0
+    elif reg == 'TRANSITIONAL':
+        macro += 3.0
+    else:
+        macro += 2.0
+    b['Macro (DXY) & regime'] = round(macro, 1)
+    b['Structural targets'] = (3.0 if plan.get('tp1_structural') else 0.0) + (2.0 if plan.get('tp2_structural') else 0.0)
+    total = int(round(sum(b.values())))
+    return max(0, min(100, total)), b, candle_notes
+
+def grade_for(score):
+    return 'A' if score >= 85 else 'B' if score >= 75 else 'C' if score >= 65 else 'D'
+
+def confidence_for(score):
+    return 'HIGH' if score >= 82 else 'MEDIUM' if score >= 72 else 'LOW'
+
+def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime, max_eval=8):
+    """Rank HTF zones, refine each with LTF, build SL/TP, score, and return the best VALID plan
+    plus a full audit trail of every candidate (so you can see why one zone beat the others)."""
+    zones = collect_entry_zones(direction, snaps, levels, atr_h1, cfg)
+    ranked = rank_entry_zones(direction, price, zones, snaps, atr_h1, cfg)
+    min_gap, _ = htf_entry_gap_bounds(price, atr_h1, cfg)
+    ltf_snaps = [('M30', snaps.get('M30')), ('M15', snaps.get('M15'))]
+    audit, valid = [], []
+    for z in ranked[:max_eval]:
+        entry, names = z['entry'], []
+        refined, ref_names = refine_entry_with_ltf(direction, z, ltf_snaps, atr_h1, price, min_gap)
+        if refined is not None:
+            entry, names = refined, ref_names
+        plan, reason = build_plan_for_entry(direction, entry, z, snaps, levels, atr_h1, cfg, ltf_names=names)
+        row = {'kind': z['kind'], 'tf': z['tf'], 'bottom': z['bottom'], 'top': z['top'], 'entry': round_price(entry, cfg),
+               'zone_score': z['zone_score'], 'dist_atr': z['dist_atr'], 'touches': z['touches'], 'confluence': z['confluence'],
+               'valid': plan is not None, 'reason': reason}
+        if plan is not None:
+            score, breakdown, candle_notes = score_plan(direction, plan, z, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
+            plan['zone'] = {'kind': z['kind'], 'tf': z['tf'], 'top': z['top'], 'bottom': z['bottom'],
+                            'touches': z['touches'], 'confluence': z['confluence'], 'zone_score': z['zone_score']}
+            plan['score'], plan['score_breakdown'], plan['candle_notes'] = score, breakdown, candle_notes
+            row['score'] = score
+            valid.append(plan)
+        audit.append(row)
+    if valid:
+        best = max(valid, key=lambda p: (p['score'], p['zone']['zone_score']))
+        best['source'] = 'HTF_STRUCTURE'
+        return best, audit
+    entry = compute_fallback_atr_plan_levels(direction, price, atr_h1, cfg)
+    fake_zone = _zone('ATR pullback (no valid HTF zone in reach)', 'H1', entry + 0.2 * atr_h1, entry - 0.2 * atr_h1, 0.0, 0)
+    fake_zone['zone_score'] = 0.0
+    plan, reason = build_plan_for_entry(direction, entry, fake_zone, snaps, levels, atr_h1, cfg)
+    if plan is None:
+        risk = max(entry * float(cfg['min_dist_pct']), atr_h1 * float(cfg['min_stop_atr']))
+        sl = entry - risk if direction == 'BUY' else entry + risk
+        tp = entry + risk * 1.7 if direction == 'BUY' else entry - risk * 1.7
+        plan = {'direction': direction, 'entry': round_price(entry, cfg), 'stop_loss': round_price(sl, cfg),
+                'take_profit': [round_price(tp, cfg), round_price(entry + risk * 3 if direction == 'BUY' else entry - risk * 3, cfg)],
+                'rr_ratio': 1.7, 'risk': float(risk), 'sl_anchor': 'ATR stop', 'tp1_kind': 'R-multiple projection',
+                'tp2_kind': 'R-multiple projection', 'tp1_structural': False, 'tp2_structural': False, 'ltf_refs': [], 'order_type': 'LIMIT'}
+    plan['zone'] = {'kind': fake_zone['kind'], 'tf': 'H1', 'top': fake_zone['top'], 'bottom': fake_zone['bottom'],
+                    'touches': 0, 'confluence': [], 'zone_score': 0.0}
+    score, breakdown, candle_notes = score_plan(direction, plan, fake_zone, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
+    plan['score'], plan['score_breakdown'], plan['candle_notes'] = min(score, 60), breakdown, candle_notes
+    plan['source'] = 'ATR_FALLBACK'
+    return plan, audit
+
+
+# =============================================================================
+# ── V3 CORE: PLAN LIFECYCLE & PLAN LOCK ─────────────────────────────────────
+# A plan is created ONCE and then managed until it fills+resolves, is missed, expires, goes
+# stale, or the HTF bias genuinely flips. Re-running the analysis returns the SAME plan instead
+# of inventing a new one — this is what ends the "BUY now, SELL 30 minutes later" behaviour.
+# =============================================================================
+def _close_plan(plan, outcome, ts, events, ledger=True):
+    plan['status'] = outcome
+    plan['closed_at'] = (ts if isinstance(ts, str) else pd.Timestamp(ts).isoformat())
+    plan['outcome'] = outcome
+    if outcome == 'TP_HIT':
+        r = float(plan.get('rr_ratio') or 0.0)
+    elif outcome == 'SL_HIT':
+        r = -1.0
+    else:
+        r = 0.0
+    plan['r_multiple'] = r
+    events.append({'type': outcome, 'time': plan['closed_at']})
+    if not ledger:
+        return
+    state = load_state()
+    state['ledger'].append({
+        'symbol': plan.get('symbol'), 'direction': plan.get('direction'), 'entry': plan.get('entry'),
+        'stop_loss': plan.get('stop_loss'), 'tp1': (plan.get('take_profit') or [None])[0], 'rr': plan.get('rr_ratio'),
+        'score': plan.get('score'), 'grade': plan.get('grade'), 'created_at': plan.get('created_at'),
+        'filled_at': plan.get('filled_at'), 'closed_at': plan['closed_at'], 'outcome': outcome, 'r': r,
+        'zone': (plan.get('zone') or {}).get('kind'),
+    })
+    if len(state['ledger']) > MAX_LEDGER:
+        state['ledger'] = state['ledger'][-MAX_LEDGER:]
+
+def evaluate_plan_lifecycle(plan, price_df, live_price=None, now=None):
+    """Walk every candle since the plan was created (pessimistic on same-candle SL/TP ambiguity)."""
+    events = []
+    if not plan or plan.get('status') not in LIVE_PLAN_STATUSES:
+        return events
+    now = now or utc_now()
+    created = parse_ts(plan.get('created_at'))
+    if created is None:
+        return events
+    buy = plan['direction'] == 'BUY'
+    entry, sl = float(plan['entry']), float(plan['stop_loss'])
+    tp1 = float(plan['take_profit'][0])
+    path = []
+    if price_df is not None and not price_df.empty:
+        window = price_df[price_df.index > created]
+        for ts, row in window.iterrows():
+            path.append((ts, float(row['High']), float(row['Low'])))
+    if live_price:
+        path.append((pd.Timestamp(now), float(live_price), float(live_price)))
+    for ts, hi, lo in path:
+        if plan['status'] == 'PENDING':
+            filled = (lo <= entry) if buy else (hi >= entry)
+            ran = ((hi >= tp1) if buy else (lo <= tp1)) and not filled
+            if filled:
+                plan['status'] = 'FILLED'
+                plan['filled_at'] = pd.Timestamp(ts).isoformat()
+                events.append({'type': 'FILLED', 'time': plan['filled_at']})
+            elif ran:
+                _close_plan(plan, 'MISSED', ts, events)
+                break
+            else:
+                continue
+        if plan['status'] == 'FILLED':
+            sl_hit = (lo <= sl) if buy else (hi >= sl)
+            tp_hit = (hi >= tp1) if buy else (lo <= tp1)
+            if sl_hit:
+                _close_plan(plan, 'SL_HIT', ts, events)
+                break
+            if tp_hit:
+                _close_plan(plan, 'TP_HIT', ts, events)
+                break
+    if plan.get('status') == 'PENDING':
+        age_h = (now - created).total_seconds() / 3600.0
+        if age_h > float(plan.get('expiry_hours', 18)):
+            _close_plan(plan, 'EXPIRED', now.isoformat(), events)
+    return events
+
+def describe_plan_event(plan, ev):
+    sym, side = plan.get('symbol'), plan.get('direction')
+    entry, sl = plan.get('entry'), plan.get('stop_loss')
+    tp1 = (plan.get('take_profit') or [None])[0]
+    kind = ev['type']
+    if kind == 'FILLED':
+        return 'success', f"✅ {sym} {side} LIMIT FILLED at {entry}. SL {sl} | TP1 {tp1}. The trade is now live."
+    if kind == 'TP_HIT':
+        return 'success', f"🎯 {sym} {side} hit TP1 {tp1} (+{plan.get('r_multiple')}R)."
+    if kind == 'SL_HIT':
+        return 'warning', f"🛑 {sym} {side} stopped out at {sl} (-1R)."
+    if kind == 'MISSED':
+        return 'info', f"⏭ {sym} {side}: price reached TP1 {tp1} without filling {entry}. Plan closed (missed) — a new plan will be built on the next run."
+    if kind == 'EXPIRED':
+        return 'info', f"⌛ {sym} {side} LIMIT {entry} expired unfilled after {plan.get('expiry_hours', 18)}h."
+    if kind == 'CANCELLED':
+        return 'warning', f"⛔ {sym} {side} LIMIT {entry} cancelled: {plan.get('cancel_reason', 'HTF bias flipped')}."
+    if kind == 'STALE':
+        return 'info', f"↔ {sym} {side} LIMIT {entry} went stale (price ran too far from the level). Re-planning."
+    return 'info', f"{sym} {side}: {kind}"
+
+def push_plan_events(symbol, plan, events):
+    for ev in events:
+        note_type, text = describe_plan_event(plan, ev)
+        add_notification(note_type, text, symbol=symbol, signal=plan.get('direction'))
+        if st.session_state.get('notify_plan_events', True) and ev['type'] in ('FILLED', 'TP_HIT', 'SL_HIT', 'CANCELLED', 'MISSED', 'EXPIRED'):
+            send_telegram_message(f"📌 <b>DER-AI PLAN UPDATE</b>\n{_escape_telegram_html(text)}")
+
+def get_plan_stats():
+    ledger = load_state().get('ledger', [])
+    tp = [x for x in ledger if x.get('outcome') == 'TP_HIT']
+    sl = [x for x in ledger if x.get('outcome') == 'SL_HIT']
+    resolved = len(tp) + len(sl)
+    total_r = sum(float(x.get('r') or 0) for x in tp + sl)
+    return {
+        'total_closed': len(ledger), 'wins': len(tp), 'losses': len(sl),
+        'missed': sum(1 for x in ledger if x.get('outcome') == 'MISSED'),
+        'expired': sum(1 for x in ledger if x.get('outcome') == 'EXPIRED'),
+        'cancelled': sum(1 for x in ledger if x.get('outcome') in ('CANCELLED', 'STALE')),
+        'win_rate': (len(tp) / resolved * 100.0) if resolved else None,
+        'total_r': round(total_r, 2), 'avg_r': round(total_r / resolved, 2) if resolved else None,
+    }
+
+def refresh_live_plans(all_data, symbols=None):
+    """Re-check every live plan against the latest candles + live quote (no new signals)."""
+    state = load_state(force=True)
+    changed = []
+    for symbol, plan in list(state['plans'].items()):
+        if symbols and symbol not in symbols:
+            continue
+        if plan.get('status') not in LIVE_PLAN_STATUSES:
+            continue
+        data = all_data.get(symbol, {}) or {}
+        finest = data.get('M10') if data.get('M10') is not None and not data.get('M10').empty else data.get('M15')
+        snap = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=finest)
+        events = evaluate_plan_lifecycle(plan, finest, live_price=snap.get('price'))
+        if events:
+            push_plan_events(symbol, plan, events)
+            changed.append(symbol)
+    save_state()
+    return changed
+
+def mark_plan_sent(symbol):
+    state = load_state()
+    plan = state['plans'].get(symbol)
+    if plan:
+        plan['sent'] = True
+        save_state()
+
+# =============================================================================
+# ── V3 CORE: TEXT BUILDERS ──────────────────────────────────────────────────
+# =============================================================================
+def _fmt(v, cfg=None):
+    if v is None:
+        return 'n/a'
+    try:
+        digits = int((cfg or {}).get('digits', 2))
+        return f"{float(v):,.{digits}f}"
+    except Exception:
+        return str(v)
+
+def describe_snapshot(snap, cfg):
+    if not snap:
+        return 'data unavailable'
+    last = snap['breaks']['last']
+    brk = f"{last['kind']} {last['dir'].lower()} ({last['age']} bars ago)" if last else 'no break'
+    obs = '; '.join(f"{o['type'].replace('_OB', '')} OB {_fmt(o['bottom'], cfg)}-{_fmt(o['top'], cfg)}" for o in snap['order_blocks'][:3]) or 'none'
+    fvg = '; '.join(f"{f['type'].replace('_FVG', '')} FVG {_fmt(f['bottom'], cfg)}-{_fmt(f['top'], cfg)}" for f in snap['fvgs'][:2]) or 'none'
+    hs = [p['price'] for p in snap['pivots'] if p['type'] == 'H' and not p.get('swept')][-2:]
+    ls = [p['price'] for p in snap['pivots'] if p['type'] == 'L' and not p.get('swept')][-2:]
+    rng = snap['range']
+    last_candle = snap.get('candles') or []
+    cndl = last_candle[-1]['pattern'] if last_candle else 'n/a'
+    return (f"structure={snap['trend']} ({snap['pattern']}), last break={brk}, EMA={snap['ema']['state']}, RSI={snap['rsi']}, last candle={cndl}, "
+            f"unmitigated OBs=[{obs}], open FVGs=[{fvg}], live swing highs={[_fmt(x, cfg) for x in hs]}, live swing lows={[_fmt(x, cfg) for x in ls]}, "
+            f"dealing range {_fmt(rng['low'], cfg)}-{_fmt(rng['high'], cfg)}")
+
+def build_plan_reasoning(symbol, plan, bias, cfg, live_price):
+    z = plan['zone']
+    side = plan['direction']
+    tps = plan['take_profit']
+    verb = 'retrace UP into' if side == 'SELL' else 'retrace DOWN into'
+    move = 'sell-off' if side == 'SELL' else 'rally'
+    bias_txt = f"HTF bias is {bias['word']} (score {bias['score']:+.0f}; H4 {bias['h4_score']:+.0f}, H1 {bias['h1_score']:+.0f}; {'H4 and H1 aligned' if bias['aligned'] else 'H4/H1 not fully aligned'})"
+    if bias['held']:
+        bias_txt += ' - standing bias retained'
+    conf = f", stacked with {', '.join(z['confluence'][:3])}" if z.get('confluence') else ''
+    ltf = f" Refined on {', '.join(plan['ltf_refs'])} inside the zone." if plan.get('ltf_refs') else ' No sharper M30/M15 level inside the zone, so the zone mean-threshold is used.'
+    return (
+        f"{bias_txt}. Price {_fmt(live_price, cfg)} is expected to {verb} the {z['kind']} ({_fmt(z['bottom'], cfg)}-{_fmt(z['top'], cfg)}{conf}) before resuming the {move}."
+        f"{ltf} Entry {_fmt(plan['entry'], cfg)}; SL {_fmt(plan['stop_loss'], cfg)} beyond {plan['sl_anchor']}; "
+        f"TP1 {_fmt(tps[0], cfg)} ({plan['tp1_kind']}, {plan['rr_ratio']}R), TP2 {_fmt(tps[1], cfg)} ({plan['tp2_kind']}). "
+        f"The idea is invalidated by an H1 close beyond {_fmt(plan['stop_loss'], cfg)} or an opposing H1/H4 structure break."
+    )
+
+def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy, dxy_rel, levels):
+    cand_lines = []
+    for n, row in enumerate(audit[:5], 1):
+        cand_lines.append(f"{n}. {row['kind']} {_fmt(row['bottom'], cfg)}-{_fmt(row['top'], cfg)} -> entry {_fmt(row['entry'], cfg)}, zone score {row['zone_score']}, "
+                          f"{row['dist_atr']} ATR away, {'VALID' if row['valid'] else 'rejected: ' + row['reason']}")
+    lv = ', '.join(f"{k} {_fmt(v, cfg)}" for k, v in levels.items()) or 'n/a'
+    m10 = snaps.get('_micro_m10') or {}
+    m10_candles = snaps.get('_candles_m10') or []
+    m10_pattern = m10_candles[-1]['pattern'] if m10_candles else 'n/a'
+    body = f"""You are the risk auditor of an institutional trading desk. A deterministic Python engine has ALREADY decided direction and exact levels using strict top-down analysis (H4/H1 decide direction; M30/M15 only refine the limit price inside the HTF zone). You may NOT change direction, entry, stop or target. Your job is to sanity-check the plan, use the chart screenshot if one is attached, flag concrete risks, and write a concise rationale.
+
+SYMBOL: {symbol} | LIVE PRICE: {_fmt(live_price, cfg)}
+LOCKED PLAN: {plan['direction']} LIMIT | entry {_fmt(plan['entry'], cfg)} | SL {_fmt(plan['stop_loss'], cfg)} | TP1 {_fmt(plan['take_profit'][0], cfg)} ({plan['tp1_kind']}) | TP2 {_fmt(plan['take_profit'][1], cfg)} | R:R {plan['rr_ratio']}
+CHOSEN ZONE: {plan['zone']['kind']} {_fmt(plan['zone']['bottom'], cfg)}-{_fmt(plan['zone']['top'], cfg)}; confluence: {', '.join(plan['zone'].get('confluence') or []) or 'none'}; LTF refinement: {', '.join(plan.get('ltf_refs') or []) or 'none'}
+PYTHON SCORE: {plan['score']}/100 -> {json.dumps(plan['score_breakdown'])}
+HTF BIAS ({bias['word']}, score {bias['score']:+.0f}): {' | '.join(bias['evidence'][:8])}. {' '.join(bias['notes'])}
+H4: {describe_snapshot(snaps.get('H4'), cfg)}
+H1: {describe_snapshot(snaps.get('H1'), cfg)}
+M30: {describe_snapshot(snaps.get('M30'), cfg)}
+M15: {describe_snapshot(snaps.get('M15'), cfg)}
+M10 MICRO: VWAP {m10.get('vwap', 'n/a')} | price vs VWAP {m10.get('price_vs_vwap', 'n/a')} | RVOL {m10.get('rvol', 'n/a')} | momentum {m10.get('momentum', 'n/a')} | last candle {m10_pattern}
+KEY LEVELS: {lv}
+DXY: {dxy.get('detail')} -> relation to this trade: {dxy_rel}
+RANKED HTF ENTRY CANDIDATES:
+{chr(10).join(cand_lines) or 'none'}
+
+TASKS:
+1. Say whether you AGREE with the plan (agree=true/false). Disagree ONLY for a concrete reason visible in the data or screenshot (e.g. entry sits under an obvious untested opposing level, target is beyond a major barrier, macro headline risk). Disagreement reduces the score; it cannot flip the trade.
+2. Give score_adjustment between -6 and +6.
+3. List up to 3 specific risk_flags (empty list if none).
+4. next_level_watch: the next key HTF level beyond TP2 and why price may approach it.
+5. If a screenshot is attached, summarise visible support/resistance/liquidity in visual_levels; otherwise write "unavailable".
+Keep everything concise. Output complete valid JSON only (no markdown, no code fences):
+{{"agree": true, "score_adjustment": 0, "htf_bias_basis": "1-2 sentences", "ltf_entry_basis": "1-2 sentences", "risk_flags": [], "next_level_watch": "...", "visual_levels": "...", "microstructure_read": "...", "reasoning": "3-4 sentences: HTF thesis, why this zone, invalidation, target"}}"""
+    return body
+
+def build_telegram_signal_message(symbol, result):
+    cfg = get_pair_config(symbol)
+    tps = result.get('take_profit') or []
+    tp1 = _fmt(tps[0], cfg) if tps else 'N/A'
+    tp2 = _fmt(tps[1], cfg) if len(tps) > 1 else None
+    signal = _escape_telegram_html(normalize_ai_signal(result.get('signal')))
+    zone = result.get('zone') or {}
+    bias = result.get('htf_bias') or {}
+    reasoning = str(result.get('reasoning') or '')
+    if len(reasoning) > 1100:
+        reasoning = reasoning[:1097] + '...'
+    lines = [
+        "🌍 <b>DER-AI MARKET SIGNAL</b>",
+        f"📊 <b>{_escape_telegram_html(symbol)}</b> - {signal} LIMIT | Grade {_escape_telegram_html(result.get('grade', '-'))}",
+        f"🧭 HTF Bias: {_escape_telegram_html(bias.get('word', 'n/a'))} (score {bias.get('score', 0):+.0f}{', H4+H1 aligned' if bias.get('aligned') else ''})",
+    ]
+    if zone:
+        lines.append(f"📍 Zone: {_escape_telegram_html(zone.get('kind'))} {_fmt(zone.get('bottom'), cfg)}-{_fmt(zone.get('top'), cfg)}")
+    lines.append(f"🤖 Model: {_escape_telegram_html(result.get('model_used', 'Unknown'))} | 📈 Score: {result.get('confluence_score', 0)}/100 | 🔋 Tokens: {result.get('total_tokens', 'N/A')}")
+    lines.append(f"🧾 Order: {_escape_telegram_html(result.get('order_type', 'LIMIT'))}")
+    tp_txt = f"🎯 TP1: {tp1}" + (f" | TP2: {tp2}" if tp2 else '')
+    lines.append(f"💰 Entry: {_fmt(result.get('entry'), cfg)} | 🛑 SL: {_fmt(result.get('stop_loss'), cfg)} | {tp_txt}")
+    lines.append(f"📐 R:R {result.get('rr_ratio')} | ⏳ Valid ~{result.get('expiry_hours', 18)}h (cancel if HTF bias flips)")
+    lines.append(f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}")
+    if result.get('risk_flags'):
+        lines.append("⚠️ " + _escape_telegram_html('; '.join(str(x) for x in result['risk_flags'][:3])))
+    lines.append(f"🧠 {_escape_telegram_html(reasoning)}")
+    return '\n'.join(lines)
+
+# =============================================================================
+# ── V3 CORE: ORCHESTRATOR ───────────────────────────────────────────────────
+# =============================================================================
+def _plan_side_ok(direction, entry, price, min_gap):
+    return (price - entry) >= min_gap * 0.999 if direction == 'BUY' else (entry - price) >= min_gap * 0.999
+
+def detect_market_closed(symbol, df):
+    """Non-crypto symbols close on weekends/holidays; a plan is still built, but not pushed."""
+    if symbol == 'BTCUSD':
+        return False
+    try:
+        mins = infer_bar_minutes(df) or 15
+        last_open = df.index[-1]
+        last_open = last_open.tz_localize('UTC') if last_open.tzinfo is None else last_open.tz_convert('UTC')
+        idle = (utc_now() - last_open.to_pydatetime()).total_seconds() / 60.0
+        return idle > max(3 * mins, 90)
+    except Exception:
+        return False
+
+def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_rel, snaps, regime, market_closed, atr_h1):
+    score = int(plan['score'])
+    ai_used = bool(ai and ai.get('api_status') in ('SUCCESS', 'SUCCESS_EXTRACTED'))
+    notes = []
+    if plan.get('source') == 'ATR_FALLBACK':
+        notes.append('No valid HTF zone was within reach, so this is a low-conviction ATR pullback plan (capped at 60 and not pushed to Telegram).')
+    notes.extend(bias['notes'])
+    notes.extend(plan.get('candle_notes') or [])
+    ai_text = ''
+    risk_flags = []
+    if ai_used:
+        try:
+            adj = int(max(-6, min(6, round(float(ai.get('score_adjustment', 0) or 0)))))
+        except Exception:
+            adj = 0
+        agree = ai.get('agree')
+        if agree is False:
+            adj = min(adj, -4)
+            notes.append('AI auditor DISAGREED with the plan (direction and levels unchanged; conviction reduced).')
+        score = max(0, min(100, score + adj))
+        if plan.get('source') == 'ATR_FALLBACK':
+            score = min(score, 60)
+        ai_text = str(ai.get('reasoning') or '').strip()
+        risk_flags = [str(x) for x in (ai.get('risk_flags') or []) if x][:3]
+    py_reason = build_plan_reasoning(symbol, plan, bias, cfg, live_price)
+    reasoning = py_reason + (f" Auditor: {ai_text}" if ai_text else '')
+    result = {
+        'symbol': symbol, 'signal': plan['direction'], 'bias': bias['word'],
+        'confluence_score': score, 'confidence': confidence_for(score), 'grade': grade_for(score),
+        'dxy_correlation': dxy_rel, 'reasoning': reasoning, 'python_reasoning': py_reason,
+        'entry': plan['entry'], 'stop_loss': plan['stop_loss'], 'take_profit': plan['take_profit'],
+        'rr_ratio': plan['rr_ratio'], 'order_type': 'LIMIT', 'exhaustion_target': plan['take_profit'][0],
+        'expiry_hours': cfg['plan_expiry_hours'], 'order_expiry': f"~{cfg['plan_expiry_hours']}h or until the HTF bias flips",
+        'invalidation': f"H1 close beyond {_fmt(plan['stop_loss'], cfg)} or an opposing H1/H4 structure break",
+        'order_description': (f"{plan['direction']} LIMIT {_fmt(plan['entry'], cfg)} | SL {_fmt(plan['stop_loss'], cfg)} | "
+                              f"TP1 {_fmt(plan['take_profit'][0], cfg)} | TP2 {_fmt(plan['take_profit'][1], cfg)} | valid ~{cfg['plan_expiry_hours']}h."),
+        'zone': plan['zone'], 'htf_bias': bias, 'score_breakdown': plan['score_breakdown'],
+        'python_score': int(plan['score']), 'candidates': audit[:6], 'levels_source': plan.get('source', 'HTF_STRUCTURE'),
+        'sl_anchor': plan['sl_anchor'], 'tp1_kind': plan['tp1_kind'], 'tp2_kind': plan['tp2_kind'], 'ltf_refs': plan.get('ltf_refs', []),
+        'python_validation_notes': notes, 'risk_flags': risk_flags, 'market_closed': market_closed,
+        'regime': (regime or {}).get('regime'), 'atr': atr_h1, 'live_price': live_price,
+        'dxy_summary': dxy.get('detail'), 'ai_used': ai_used,
+        'microstructure_read': (ai.get('microstructure_read') if ai_used and ai.get('microstructure_read') else
+                                'VWAP {} | RVOL {} | momentum {} | last candle {}'.format(
+                                    *[(snaps.get('_micro_m10') or {}).get(k, 'n/a') for k in ('price_vs_vwap', 'rvol', 'momentum')],
+                                    ((snaps.get('_candles_m10') or [{}])[-1] or {}).get('pattern', 'n/a'))),
+        'visual_levels': (ai.get('visual_levels') if ai_used else 'unavailable'),
+        'next_level_watch': (ai.get('next_level_watch') if ai_used and ai.get('next_level_watch') else
+                             f"Beyond TP2 the next liquidity to watch is the {'H4 range high' if plan['direction'] == 'BUY' else 'H4 range low'} at "
+                             f"{_fmt((snaps.get('H4') or snaps.get('H1'))['range']['high' if plan['direction'] == 'BUY' else 'low'], cfg)}."),
+        'htf_bias_basis': (ai.get('htf_bias_basis') if ai_used else None), 'ltf_entry_basis': (ai.get('ltf_entry_basis') if ai_used else None),
+        'model_used': (ai.get('model_used') if ai_used else 'Python structure engine (AI auditor unavailable)'),
+        'api_status': (ai.get('api_status') if ai_used else 'ENGINE_ONLY'),
+        'total_tokens': (ai.get('total_tokens', 0) if ai else 0), 'prompt_tokens': (ai.get('prompt_tokens', 0) if ai else 0),
+        'completion_tokens': (ai.get('completion_tokens', 0) if ai else 0),
+        'model_attempts': (ai.get('model_attempts') if ai else None),
+        'market_state': 'continuation' if bias['aligned'] else 'coiling',
+    }
+    if ai and not ai_used:
+        result['groq_failure'] = ai.get('rejection_reason')
+        result['groq_api_status'] = ai.get('api_status')
+    return result
+
+def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='image/png', force_new=False, use_ai=True):
+    try:
+        state = load_state()
+        data = all_data.get(symbol, {}) or {}
+        m10 = data.get('M10', pd.DataFrame())
+        yf_symbol = YFINANCE_MAP.get(symbol, symbol)
+        live_snapshot = get_live_market_snapshot(symbol, yf_symbol, fallback_df=m10)
+        if m10 is None or m10.empty:
+            return {"error": f"Failed to fetch market data for {symbol}. The data source may be rate-limiting your IP. Wait a few minutes and try again."}
+        refreshed = refresh_symbol_data_if_stale(symbol, yf_symbol, live_snapshot, data)
+        if refreshed is not data:
+            data = refreshed
             all_data[symbol] = data
             m10 = data.get('M10', pd.DataFrame())
-            h1 = data.get('H1', pd.DataFrame())
-            h4 = data.get('H4', pd.DataFrame())
-            if m10.empty:
+            if m10 is None or m10.empty:
                 return {"error": f"Fresh market data was unavailable for {symbol}. Please try again."}
-            
-        micro = calculate_microstructure(m10)
-        current_price = live_snapshot.get('price') or float(m10['Close'].iloc[-1])
-        pair_config = get_pair_config(symbol)
-        m15_data = data.get('M15', pd.DataFrame())
-        m30_data = data.get('M30', pd.DataFrame())
+        current_price = float(live_snapshot.get('price') or m10['Close'].iloc[-1])
+        cfg = get_pair_config(symbol)
+        market_closed = detect_market_closed(symbol, m10)
 
-        # --- Timeframe roles ---------------------------------------------------------------
-        # H4 (macro) + H1 (primary) decide DIRECTION: bias, market_state, structural score,
-        # the directional evidence ledger, and SL/TP/exhaustion-target sizing.
-        # M15 (primary) + M30 (confirm) + M10 (timing) decide ONLY the exact LIMIT entry price
-        # within whatever zone the HTF bias points to, plus immediate timing/momentum confirmation.
-        h4_struct = compute_timeframe_structure(h4, 'H4')
-        h1_struct = compute_timeframe_structure(h1, 'H1')
-        m30_struct = compute_timeframe_structure(m30_data, 'M30')
-        m15_struct = compute_timeframe_structure(m15_data, 'M15')
-        m10_struct = compute_timeframe_structure(m10, 'M10')
-
-        htf_swings = (h1_struct or {}).get('swings') or find_swings(h1) if not h1.empty else find_swings(m10)
-        htf_order_blocks = (h1_struct or {}).get('order_blocks') or []
-        htf_fvgs = (h1_struct or {}).get('fvgs') or []
-        atr_htf = (h1_struct or {}).get('atr') or calculate_atr(m10)
-
-        ltf_swings = (m15_struct or {}).get('swings') or find_swings(m10)
-        ltf_order_blocks = (m15_struct or {}).get('order_blocks') or detect_order_blocks(m10)
-        ltf_fvgs = (m15_struct or {}).get('fvgs') or detect_fvg(m10)
-        atr_ltf = (m15_struct or {}).get('atr') or calculate_atr(m10)
-
-        candles = (m15_struct or {}).get('candles') or analyze_candle_structure(m10)
-        # `swings` stays as the name every downstream direction-guard function expects — it is
-        # now the HTF (H1) swing set, consistent with "HTF decides direction".
-        swings = htf_swings
-
-        pair_config = get_pair_config(symbol)
-        
-        dxy_data = all_data.get('DXY', {}).get('H1', pd.DataFrame())
-        dxy_summary = "DXY Data Unavailable"
-        dxy_context = None
-        if not dxy_data.empty:
-            dxy_price = dxy_data['Close'].iloc[-1]
-            dxy_micro = calculate_microstructure(dxy_data)
-            dxy_context = {'trend': dxy_micro['momentum'], 'price_vs_vwap': dxy_micro['price_vs_vwap']}
-            dxy_summary = f"Current: {dxy_price} | VWAP Position: {dxy_micro['price_vs_vwap']} | Momentum: {dxy_micro['momentum']} | RVOL: {dxy_micro['rvol']}"
-            
-        htf_context = None
-        if not h4.empty:
-            h4_micro = calculate_microstructure(h4)
-            htf_context = {'trend': h4_micro['momentum'], 'bias': h4_micro['momentum'], 'price_vs_vwap': h4_micro['price_vs_vwap']}
-            
-        picture = build_mtf_picture(all_data, symbol)
-        firm = None
-        firm_notes = []
-        if picture:
-            firm, firm_notes = resolve_firm_direction(symbol, picture)
-            
-        # Bias-defining context now comes from H1 (was M10) — market phase / setup type / the
-        # Python structural score are all directional classifications and belong on the
-        # timeframe the direction is actually decided on.
-        phase_context = detect_market_phase(h1 if not h1.empty else m10, swings=htf_swings)
-        setup_context = build_setup_context(h1 if not h1.empty else m10, htf_swings, current_price, symbol, dxy_context=dxy_context)
-        # entry_quality/entry_timing are an LTF (M15) question — is a pullback happening right
-        # now — so they're overridden here from a dedicated LTF pass rather than the HTF one.
-        ltf_setup_context = build_setup_context(m15_data if not m15_data.empty else m10, ltf_swings, current_price, symbol, dxy_context=None)
-        setup_context['entry_quality'] = ltf_setup_context.get('entry_quality', setup_context.get('entry_quality'))
-        setup_context['entry_timing'] = ltf_setup_context.get('entry_timing', setup_context.get('entry_timing'))
-        structural_context = calculate_structural_score(h1 if not h1.empty else m10, symbol, dxy_context=dxy_context, phase_context=phase_context)
-        
-        htf_structure_text = build_htf_structure_block(h4_struct, h1_struct, h1, current_price, pair_config)
-        ltf_structure_text = build_ltf_entry_block(m30_struct, m15_struct, m10_struct, current_price, pair_config)
-        rsi_values = build_rsi_values_context(all_data, symbol)
-        volatility_context = (
-            f"LTF (M15, entry-timing) ATR {atr_ltf:.5f} | HTF (H1, risk-sizing) ATR {atr_htf:.5f}."
-            if atr_ltf and atr_htf else "ATR unavailable."
-        )
-        
-        # Directional evidence ledger now runs on H1 (was M10) — this is the primary vote that
-        # decides BUY vs SELL, so it needs to be built on a timeframe that isn't noise.
-        ledger = detect_directional_confluence(h1 if not h1.empty else m10, swings=htf_swings, htf_context=htf_context, dxy_context=dxy_context, symbol=symbol)
-        directional_ledger = f"Bullish ({ledger['bull_count']}): {'; '.join(ledger['bullish_evidence']) or 'none'} | Bearish ({ledger['bear_count']}): {'; '.join(ledger['bearish_evidence']) or 'none'} | Ledger direction: {ledger['direction'] or 'none'}"
-        
-        rsi_context = f"H1 RSI div: {h1_struct['divergence']['type']} - {h1_struct['divergence']['reason']}" if h1_struct and h1_struct.get('divergence') else "H1 RSI div: none."
-        rsi_context += f" | M15 RSI div: {m15_struct['divergence']['type']} - {m15_struct['divergence']['reason']}" if m15_struct and m15_struct.get('divergence') else " | M15 RSI div: none."
-            
-        h1_summary = f"Latest H1 close: {h1['Close'].iloc[-1]:.2f}" if not h1.empty else "H1 data unavailable"
-        h4_summary = f"Latest H4 close: {h4['Close'].iloc[-1]:.2f}" if not h4.empty else "H4 data unavailable"
-        htf_summary = f"H1: {h1_summary} | H4: {h4_summary}"
-        
-        prompt_data = f"Symbol: {symbol} | Live Price: {current_price} | Live Price Source: {live_snapshot.get('source')} | Quote Time: {live_snapshot.get('quote_time', 'N/A')} | Market Phase (H1): {phase_context['phase']} | Phase Reason: {phase_context['reason']} | Setup Type (H1): {setup_context['setup_type']} | Entry Timing (M15): {setup_context['entry_timing']} | Entry Quality (M15): {setup_context['entry_quality']} | Entry Rule: propose a resting LIMIT order at a genuine M15/M30 pullback level inside the entry-gap band; never at or near the live price."
-        prompt_micro = f"VWAP: {micro.get('vwap', 'N/A')} | Price vs VWAP: {micro.get('price_vs_vwap', 'N/A')} | RVOL: {micro.get('rvol', 'N/A')} ({micro.get('volume_anomaly', 'N/A')})"
-        structural_score_context = f"Python structural score (H1-based): {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
-        historical_context = build_historical_context(m10)
-        firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
-        min_gap, max_gap = get_entry_gap_bounds(current_price, atr_ltf, pair_config)
-        max_entry_distance = (
-            f"Entry must be between {min_gap:.5f} and {max_gap:.5f} price-units away from the live quote "
-            f"({symbol}) — below live price for BUY LIMIT, above it for SELL LIMIT. Closer than "
-            f"{min_gap:.5f} is a disguised market order and will be rejected and rebuilt; farther than "
-            f"{max_gap:.5f} is unrealistic and will be rejected and rebuilt."
-        )
-        candidate_levels = build_candidate_levels(
-            symbol, current_price, ltf_swings, ltf_order_blocks, ltf_fvgs, atr_ltf,
-            htf_swings, htf_order_blocks, htf_fvgs, atr_htf, pair_config,
-            vwap=micro.get('vwap'), htf_df=h1 if not h1.empty else None
-        )
-        
-        all_format_kwargs = {
-            'data_summary': prompt_data, 'microstructure_data': prompt_micro,
-            'htf_structure': htf_structure_text, 'ltf_structure': ltf_structure_text,
-            'rsi_values': rsi_values, 'rsi_context': rsi_context,
-            'volatility_context': volatility_context, 'htf_context': htf_summary, 'dxy_data': dxy_summary,
-            'historical_context': historical_context, 'structural_score_context': structural_score_context,
-            'directional_ledger': directional_ledger, 'firm_bias': firm_bias_text,
-            'max_entry_distance': max_entry_distance, 'candidate_levels': json.dumps(candidate_levels, indent=2, default=str),
+        # ── 1. Structural snapshots (CLOSED candles only) ────────────────────────────
+        h1_raw = data.get('H1', pd.DataFrame())
+        h4_raw = ensure_h4(h1_raw, data.get('H4', pd.DataFrame()))
+        snaps = {
+            'H4': analyze_structure(h4_raw, 'H4', left=2, right=2, leg_atr=1.0, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
+            'H1': analyze_structure(h1_raw, 'H1', left=3, right=3, leg_atr=1.0, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
+            'M30': analyze_structure(data.get('M30'), 'M30', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
+            'M15': analyze_structure(data.get('M15'), 'M15', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
         }
-        
-        try:
-            prompt_text = build_market_analysis_prompt().format(**all_format_kwargs)
-        except KeyError as exc:
-            missing_key = str(exc).strip("'")
-            prompt_text = build_market_analysis_prompt().format(**{**all_format_kwargs, missing_key: f"[missing:{missing_key}]"})
-            
-        user_content = [{"type": "text", "text": prompt_text}]
-        estimated_tokens = estimate_analysis_tokens(prompt_text, [])
-        
-        # 🚀 CALL AI FIRST — max_tokens intentionally omitted so call_groq applies each
-        # model's own tuned max_completion_tokens/reasoning_effort instead of one shared cap.
-        analysis = call_groq(
-            prompt_text, [],
-            estimated_tokens=estimated_tokens,
-            image_b64=image_b64, image_mime_type=image_mime_type
-        )
-        st.session_state.last_model_attempts[symbol] = analysis.get('model_attempts', [])
-        
-        _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
-        if _post_ai_snapshot.get("price"):
-            current_price = _post_ai_snapshot.get("price")
-            
-        analysis = normalize_analysis_signals(analysis)
-        analysis.setdefault('model_used', PYTHON_FALLBACK_MODEL)
-        analysis.setdefault('microstructure_read', prompt_micro)
-        analysis.setdefault('rsi_context', rsi_context)
-        analysis.setdefault('dxy_summary', dxy_summary)
-        analysis.setdefault('live_price', current_price)
-        analysis['setup_context'] = setup_context
-        analysis['market_state'] = analysis.get('market_state') or setup_context['setup_type']
-        update_market_state(analysis.get('market_state') or setup_context['setup_type'])
-        
-        # 🚨 STRICT FALLBACK TRIGGER: Only fallback if API completely failed
-        if analysis.get('api_status') not in ['SUCCESS', 'SUCCESS_EXTRACTED']:
-            groq_failure = analysis.get('rejection_reason', 'Unknown API Error')
-            groq_status = analysis.get('api_status', 'UNKNOWN')
-            groq_model = analysis.get('model_used', 'None')
-            groq_raw_output = analysis.get('raw_output', '')
-            groq_tokens = {
-                key: analysis.get(key, 0)
-                for key in ('total_tokens', 'prompt_tokens', 'completion_tokens')
-            }
-            analysis = build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, candles=candles, phase_context=phase_context, live_price=current_price, htf_context=htf_context, picture=picture, firm=firm, firm_notes=firm_notes, learning=None, historical_context=historical_context)
-            analysis = normalize_analysis_signals(analysis)
-            analysis['groq_failure'] = groq_failure
-            analysis['groq_api_status'] = groq_status
-            analysis['groq_model'] = groq_model
-            analysis.update(groq_tokens)
-            if groq_raw_output:
-                analysis['groq_raw_output'] = groq_raw_output
-            analysis['estimated_tokens'] = analysis.get('estimated_tokens', estimated_tokens)
-            
-        # 🚨 FORCE BUY/SELL (No WAIT allowed from AI)
-        if analysis.get('signal') == 'WAIT':
-            firm_norm = normalize_ai_signal(firm) if firm else None
-            if firm_norm:
-                analysis['signal'] = firm_norm
-                add_python_validation_note(analysis, f"AI attempted to WAIT; direction forced to {firm_norm} based on standing desk bias.")
+        snaps['_micro_m10'] = calculate_microstructure(m10)
+        snaps['_candles_m10'] = classify_candles(closed_candles(m10))
+        if not snaps['H1']:
+            return {"error": f"Not enough closed H1 history for {symbol} to build a reliable higher-timeframe structure. Try again shortly."}
+        atr_h1 = snaps['H1']['atr']
+        levels = prior_period_levels(h1_raw)
+        dxy = compute_dxy_context(all_data)
+        regime = classify_market_regime(snaps['H1']['df'])
+
+        # ── 2. Manage any existing plan BEFORE deciding anything new ─────────────────
+        events = []
+        existing = state['plans'].get(symbol)
+        if existing and existing.get('status') in LIVE_PLAN_STATUSES:
+            events += evaluate_plan_lifecycle(existing, m10, live_price=current_price)
+            if existing.get('status') == 'PENDING':
+                _, max_gap = htf_entry_gap_bounds(current_price, atr_h1, cfg)
+                if abs(current_price - float(existing['entry'])) > 1.25 * max_gap:
+                    _close_plan(existing, 'STALE', utc_now().isoformat(), events)
+        if events and existing:
+            push_plan_events(symbol, existing, events)
+
+        # ── 3. HTF bias (H4 + H1 only, persistent hysteresis) ────────────────────────
+        bias = resolve_htf_bias(symbol, snaps, dxy, persist=True)
+        direction = bias['direction']
+        dxy_rel = dxy_relation(symbol, direction, dxy)
+
+        live_existing = existing if (existing and existing.get('status') in LIVE_PLAN_STATUSES) else None
+        plan_state = 'NEW'
+        if live_existing and not force_new:
+            if live_existing['direction'] == direction:
+                provisional = live_existing.get('status') == 'PENDING' and not live_existing.get('sent')
+                if not provisional:
+                    plan_state = 'REUSED'
+                else:
+                    plan_state = 'PROVISIONAL'
             else:
-                analysis['signal'] = 'BUY' if micro.get('momentum') == 'BULLISH' else 'SELL'
-                add_python_validation_note(analysis, f"AI attempted to WAIT; direction forced to {analysis['signal']} based on microstructure momentum.")
-            analysis['confidence'] = 'LOW'
-            
-        analysis = apply_htf_trend_guard(analysis, symbol, htf_context)
-        
-        ai_score = int(round(analysis.get('confluence_score', 0)))
-        analysis['confluence_score'] = min(100, max(0, ai_score))
-        if analysis.get('confidence') == 'LOW' and analysis['confluence_score'] >= 75:
-            analysis['confidence'] = 'MEDIUM'
-        elif analysis.get('confidence') == 'MEDIUM' and analysis['confluence_score'] >= 85:
-            analysis['confidence'] = 'HIGH'
-            
-        analysis['structural_score'] = structural_context['structural_score']
-        analysis['atr'] = atr_htf
-        analysis['score_reason'] = structural_context['score_reason']
-        analysis['candidate_direction'] = structural_context['candidate_direction']
-        
-        analysis = apply_dxy_guardrails(analysis, symbol, dxy_context)
-        analysis = cross_check_ai_evidence(analysis)
-        analysis = apply_direction_correction_guard(analysis, ledger, symbol)
-        analysis = cross_check_ai_evidence(analysis)
-        
-        firm_norm = normalize_ai_signal(firm) if firm else None
-        if firm_norm and analysis.get('signal') in ('BUY', 'SELL') and analysis['signal'] != firm_norm:
-            ev = analysis.get('directional_evidence') or {}
-            counter = len(ev.get('bullish', [])) if firm_norm == 'BUY' else len(ev.get('bearish', []))
-            if counter >= 3:
-                add_python_validation_note(analysis, f"AI overrode the standing {firm_norm} desk bias with {counter} counter-evidences.")
-            else:
-                analysis['signal'] = firm_norm
-                add_python_validation_note(analysis, f"Standing {firm_norm} desk bias was maintained and the AI direction was aligned to it.")
-                
-        analysis = apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, current_price, swings, symbol, pair_config=pair_config)
-        
-        analysis = finalize_trade_plan(
-            analysis=analysis, symbol=symbol, current_price=current_price,
-            ltf_swings=ltf_swings, ltf_order_blocks=ltf_order_blocks, ltf_fvgs=ltf_fvgs, atr_ltf=atr_ltf,
-            htf_swings=htf_swings, htf_order_blocks=htf_order_blocks, htf_fvgs=htf_fvgs, atr_htf=atr_htf,
-            pair_config=pair_config, htf_df=h1 if not h1.empty else None, ltf_df=m15_data if not m15_data.empty else m10
-        )
-        
-        if analysis.get('signal') in ('BUY', 'SELL') and analysis.get('take_profit'):
-            final_note = f"Final levels: Entry {analysis['entry']} | SL {analysis['stop_loss']} | TP {analysis['take_profit'][0]}."
-            analysis['order_description'] = f"{final_note} {analysis.get('order_description') or ''}".strip()
-            if not analysis.get('next_level_watch'):
-                # The AI didn't populate this (or Python built the plan) — derive the next
-                # structural level beyond TP so the user always sees where price is likely
-                # headed next if the trade keeps running, per "next level approaching".
-                try:
-                    tp1 = analysis['take_profit'][0]
-                    next_level = build_exhaustion_target(
-                        analysis['signal'], tp1, h1 if not h1.empty else m10, htf_swings, htf_order_blocks, htf_fvgs,
-                        atr_htf, pair_config
-                    )
-                    if next_level and abs(next_level - tp1) > (atr_htf or 0) * 0.1:
-                        analysis['next_level_watch'] = (
-                            f"Beyond TP1, the next level in play is ~{round_price(next_level, pair_config)} "
-                            f"— watch for price to approach it if {symbol} continues {analysis['signal'].lower()}ing "
-                            f"through the current {analysis.get('market_state', 'phase')}."
-                        )
-                except Exception:
-                    pass
-            
-        analysis['validation_detail'] = build_validation_detail(analysis, swings, current_price, symbol, pair_config=pair_config, structural_context=structural_context)
-        analysis['display_reasoning'] = build_display_reason(analysis, symbol, current_price=current_price, phase_context=phase_context, structural_context=structural_context, dxy_context=dxy_context)
-        analysis['symbol'] = symbol
-        analysis = normalize_analysis_signals(analysis)
-        analysis['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        return analysis
-        
+                if live_existing['status'] == 'PENDING':
+                    live_existing['cancel_reason'] = f"HTF bias flipped to {direction} ({bias['score']:+.0f})"
+                    ev = []
+                    _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), ev)
+                    push_plan_events(symbol, live_existing, ev)
+                    live_existing = None
+                    plan_state = 'NEW'
+                else:
+                    plan_state = 'OPEN_TRADE_CONFLICT'
+        elif live_existing and force_new:
+            if live_existing['status'] == 'PENDING':
+                live_existing['cancel_reason'] = 'manual "force fresh plan" override'
+                _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), [], ledger=False)
+                live_existing = None
+            plan_state = 'NEW'
+
+        def _reuse_result(label):
+            result = dict(live_existing.get('result') or {})
+            result['plan_state'] = label
+            result['plan_status'] = live_existing['status']
+            result['live_price'] = current_price
+            result['htf_bias'] = bias
+            result['analyzed_at_live'] = utc_now().isoformat()
+            result['gap_to_entry'] = round(abs(current_price - float(live_existing['entry'])), cfg['digits'])
+            if label == 'OPEN_TRADE_CONFLICT':
+                result.setdefault('python_validation_notes', [])
+                msg = f"HTF bias is now {direction} but the {live_existing['direction']} trade is already FILLED and open — manage it (SL/TP unchanged). A new plan will be built after it closes."
+                if msg not in result['python_validation_notes']:
+                    result['python_validation_notes'].append(msg)
+                if not live_existing.get('flip_warned'):
+                    live_existing['flip_warned'] = True
+                    add_notification('warning', f"⚠️ {symbol}: {msg}", symbol=symbol)
+                    if st.session_state.get('notify_plan_events', True):
+                        send_telegram_message(f"⚠️ <b>DER-AI</b>\n{_escape_telegram_html(symbol)}: {_escape_telegram_html(msg)}")
+            result['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            result['events'] = events
+            save_state()
+            return result
+
+        if plan_state in ('REUSED', 'OPEN_TRADE_CONFLICT'):
+            return _reuse_result(plan_state)
+
+        # ── 4. Build the best HTF-anchored limit plan ────────────────────────────────
+        plan, audit = select_best_plan(direction, current_price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime)
+        if plan_state == 'PROVISIONAL':
+            # An unsent (low-conviction) plan is only replaced if the fresh candidate would actually
+            # clear the send threshold — otherwise keep the old plan so levels don't drift run to run.
+            thr = int(st.session_state.get('min_send_score', MINIMUM_CONFLUENCE_SCORE))
+            if plan['score'] < thr or plan.get('source') == 'ATR_FALLBACK':
+                return _reuse_result('REUSED')
+
+        # ── 5. AI auditor (cannot change direction/levels) ───────────────────────────
+        ai = None
+        if use_ai and get_secret('GROQ_API_KEY', '').strip():
+            prompt_text = build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, current_price, dxy, dxy_rel, levels)
+            ai = call_groq(prompt_text, [], estimated_tokens=estimate_analysis_tokens(prompt_text, []), image_b64=image_b64, image_mime_type=image_mime_type)
+            st.session_state.last_model_attempts[symbol] = ai.get('model_attempts', [])
+            post = get_live_market_snapshot(symbol, yf_symbol, fallback_df=m10)
+            if post.get('price'):
+                new_price = float(post['price'])
+                min_gap, _ = htf_entry_gap_bounds(new_price, atr_h1, cfg)
+                if not _plan_side_ok(direction, float(plan['entry']), new_price, min_gap):
+                    current_price = new_price
+                    plan, audit = select_best_plan(direction, current_price, snaps, levels, atr_h1, cfg, bias, dxy_rel=dxy_rel, regime=regime)
+                    plan.setdefault('notes', []).append('Rebuilt after the AI call because live price moved through the original entry.')
+                else:
+                    current_price = new_price
+        result = _finalize_result(symbol, plan, bias, audit, cfg, current_price, ai, dxy, dxy_rel, snaps, regime, market_closed, atr_h1)
+        result['plan_state'] = 'REPLANNED' if plan_state == 'PROVISIONAL' else 'NEW'
+        result['plan_status'] = 'PENDING'
+        result['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result['events'] = events
+
+        ok, reason = validate_signal_math(result, pair_config=cfg)
+        if not ok:
+            result['python_validation_notes'].append(f"Math check: {reason}")
+
+        # ── 6. Lock the plan ─────────────────────────────────────────────────────────
+        if live_existing and plan_state == 'PROVISIONAL':
+            live_existing['cancel_reason'] = 'replaced by a higher-quality plan in the same direction'
+            _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), [], ledger=False)
+        lock_result = to_jsonable({k: v for k, v in result.items() if k not in ('events', 'model_attempts')})
+        state['plans'][symbol] = {
+            'plan_id': uuid.uuid4().hex[:8], 'symbol': symbol, 'direction': direction, 'status': 'PENDING',
+            'created_at': utc_now().isoformat(), 'entry': plan['entry'], 'stop_loss': plan['stop_loss'],
+            'take_profit': plan['take_profit'], 'rr_ratio': plan['rr_ratio'], 'expiry_hours': cfg['plan_expiry_hours'],
+            'score': result['confluence_score'], 'grade': result['grade'], 'zone': to_jsonable(plan['zone']),
+            'sent': False, 'result': lock_result,
+        }
+        save_state()
+        return result
     except Exception as e:
+        traceback.print_exc()
         return {"error": str(e), "api_status": "PYTHON_EXCEPTION"}
+
+def should_send_to_telegram(result):
+    if result.get('plan_state') not in ('NEW', 'REPLANNED'):
+        return False, 'existing plan unchanged - no new signal to push'
+    if result.get('market_closed'):
+        return False, 'market appears closed - plan stored but not pushed'
+    if result.get('levels_source') == 'ATR_FALLBACK' and not st.session_state.get('send_low_conviction', False):
+        return False, 'no valid HTF zone in reach (low-conviction fallback plan)'
+    threshold = int(st.session_state.get('min_send_score', MINIMUM_CONFLUENCE_SCORE))
+    if result.get('confluence_score', 0) < threshold and not st.session_state.get('send_low_conviction', False):
+        return False, f"score {result.get('confluence_score', 0)} is below the {threshold} send threshold"
+    return True, ''
+
+# =============================================================================
+# ── V3 CORE: CHART ──────────────────────────────────────────────────────────
+# =============================================================================
+def plot_plan_chart(h1_df, result, bars=110):
+    d = closed_candles(h1_df)
+    if d is None or d.empty:
+        return None
+    d = d.tail(bars)
+    fig, ax = plt.subplots(figsize=(10, 4.3))
+    o, h, l, c = (d[k].to_numpy(dtype=float) for k in ('Open', 'High', 'Low', 'Close'))
+    span = max(float(h.max() - l.min()), 1e-9)
+    for i in range(len(d)):
+        color = '#10b981' if c[i] >= o[i] else '#ef4444'
+        ax.vlines(i, l[i], h[i], color=color, linewidth=0.8)
+        ax.add_patch(Rectangle((i - 0.3, min(o[i], c[i])), 0.6, max(abs(c[i] - o[i]), span * 0.0008), color=color))
+    zone = result.get('zone') or {}
+    if zone.get('top') is not None:
+        ax.axhspan(zone['bottom'], zone['top'], color='#3b82f6', alpha=0.18, label='HTF entry zone')
+    tps = result.get('take_profit') or []
+    lines = [('Entry', result.get('entry'), '#2563eb', '-'), ('SL', result.get('stop_loss'), '#dc2626', '--')]
+    if tps:
+        lines.append(('TP1', tps[0], '#059669', '--'))
+        if len(tps) > 1:
+            lines.append(('TP2', tps[1], '#34d399', ':'))
+    lines.append(('Live', result.get('live_price'), '#6b7280', ':'))
+    lo_v, hi_v = float(l.min()), float(h.max())
+    for name, val, color, style in lines:
+        if val is None:
+            continue
+        val = float(val)
+        if name == 'TP2' and (val > hi_v + span * 0.25 or val < lo_v - span * 0.25):
+            continue
+        ax.axhline(val, color=color, linestyle=style, linewidth=1.1)
+        ax.text(len(d) + 0.5, val, f" {name} {val:,.5g}", color=color, fontsize=8, va='center')
+        lo_v, hi_v = min(lo_v, val), max(hi_v, val)
+    pad = (hi_v - lo_v) * 0.06
+    ax.set_ylim(lo_v - pad, hi_v + pad)
+    ax.set_xlim(-1, len(d) + 14)
+    ax.set_title(f"{result.get('symbol', '')} H1 — {result.get('signal')} LIMIT plan", fontsize=10)
+    ax.grid(alpha=0.15)
+    ax.set_xticks([])
+    fig.tight_layout()
+    return fig
+
 
 # ── UI Layout ──────────────────────────────────────────────────────────────
 st.title("📊 Der-AI | Institutional Market Analysis")
-st.markdown("**Multi-Timeframe Structure | SMC | DXY Correlation | Multimodal Chart Analysis**")
+st.markdown("**Top-down structure engine | HTF bias with hysteresis | Plan lock | SMC | DXY | AI risk auditor**")
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Market Analysis", "📜 Signal History", "🔔 Notifications", "⚙️ Settings"])
+STATE_LABELS = {
+    'NEW': '🆕 New plan',
+    'REPLANNED': '🔄 Upgraded plan (replaced an unsent low-conviction one)',
+    'REUSED': '🔒 Existing plan still valid — locked, no new signal',
+    'OPEN_TRADE_CONFLICT': '⚠️ Open trade in progress — HTF bias has since changed',
+}
+
+def render_signal_card(symbol, result, all_data):
+    cfg = get_pair_config(symbol)
+    sig = result.get('signal')
+    icon = '🟢' if sig == 'BUY' else '🔴'
+    state = result.get('plan_state', 'NEW')
+    st.markdown(f"### {icon} {symbol} — {sig} LIMIT · Grade {result.get('grade', '-')} ({result.get('confluence_score', 0)}/100)")
+    st.caption(f"{STATE_LABELS.get(state, state)} · plan status: {result.get('plan_status', 'PENDING')} · live price {_fmt(result.get('live_price'), cfg)}")
+    if state == 'REUSED':
+        st.info("This plan was created earlier and is still valid (not filled, not invalidated, HTF bias unchanged). "
+                "The engine deliberately does NOT invent a fresh signal from a new candle. Tick “Force fresh plan” to override.")
+    if result.get('market_closed'):
+        st.warning("Market appears closed for this symbol — the plan is stored but won't be pushed to Telegram.")
+    tps = result.get('take_profit') or [None, None]
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric('Entry (LIMIT)', _fmt(result.get('entry'), cfg))
+    c2.metric('Stop loss', _fmt(result.get('stop_loss'), cfg))
+    c3.metric('TP1', _fmt(tps[0], cfg))
+    c4.metric('TP2', _fmt(tps[1] if len(tps) > 1 else None, cfg))
+    c5.metric('R:R (TP1)', result.get('rr_ratio', 'N/A'))
+    bias = result.get('htf_bias') or {}
+    if bias:
+        st.write(f"**🧭 HTF bias:** {bias.get('word')} · score {bias.get('score', 0):+.0f} (H4 {bias.get('h4_score', 0):+.0f} / H1 {bias.get('h1_score', 0):+.0f}) · "
+                 f"{'H4+H1 aligned' if bias.get('aligned') else 'H4/H1 not fully aligned'} · since {str(bias.get('since', ''))[:16].replace('T', ' ')} UTC")
+    zone = result.get('zone') or {}
+    if zone:
+        conf = f" — confluence: {', '.join(zone['confluence'])}" if zone.get('confluence') else ''
+        st.write(f"**📍 Entry zone:** {zone.get('kind')} {_fmt(zone.get('bottom'), cfg)}–{_fmt(zone.get('top'), cfg)}{conf}")
+    st.write(f"**Stop anchor:** {result.get('sl_anchor')} · **TP1:** {result.get('tp1_kind')} · **TP2:** {result.get('tp2_kind')}")
+    st.write(f"**DXY correlation:** {result.get('dxy_correlation', 'N/A')} · **Regime (H1):** {result.get('regime', 'n/a')} · **Microstructure:** {result.get('microstructure_read', 'N/A')}")
+    if result.get('order_description'):
+        st.write(f"**Execution plan:** {result.get('order_description')}")
+    if result.get('invalidation'):
+        st.write(f"**Invalidation:** {result.get('invalidation')}")
+    if result.get('next_level_watch'):
+        st.write(f"**🔭 Next level watch:** {result.get('next_level_watch')}")
+    if result.get('risk_flags'):
+        st.warning('⚠️ AI risk flags: ' + '; '.join(result['risk_flags']))
+    st.write(f"**Reasoning:** {result.get('reasoning')}")
+    notes = result.get('python_validation_notes') or []
+    if notes:
+        st.write('**Engine notes:** ' + ' '.join(notes))
+    with st.expander('📊 Score breakdown (why this score)'):
+        breakdown = result.get('score_breakdown') or {}
+        if breakdown:
+            df_bd = pd.DataFrame({'Component': list(breakdown.keys()), 'Points': list(breakdown.values())})
+            st.dataframe(df_bd, hide_index=True, use_container_width=True)
+        st.caption(f"Python score {result.get('python_score', '-')} → final {result.get('confluence_score')} (AI auditor may adjust ±6; it can never change direction or levels).")
+    with st.expander('🔎 Entry candidates the engine compared'):
+        rows = result.get('candidates') or []
+        if rows:
+            st.dataframe(pd.DataFrame([{
+                'Zone': r.get('kind'), 'Range': f"{_fmt(r.get('bottom'), cfg)}–{_fmt(r.get('top'), cfg)}", 'Limit entry': _fmt(r.get('entry'), cfg),
+                'Zone score': r.get('zone_score'), 'ATR away': r.get('dist_atr'), 'Tested': r.get('touches'),
+                'Plan score': r.get('score', '—'), 'Result': 'chosen/valid' if r.get('valid') else r.get('reason'),
+            } for r in rows]), hide_index=True, use_container_width=True)
+        else:
+            st.caption('No HTF zone was in reach on the correct side of price.')
+    try:
+        h1_df = (all_data.get(symbol, {}) or {}).get('H1')
+        if h1_df is not None and not h1_df.empty:
+            fig = plot_plan_chart(h1_df, result)
+            if fig is not None:
+                st.pyplot(fig)
+                plt.close(fig)
+    except Exception as exc:
+        st.caption(f"Chart unavailable: {exc}")
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Market Analysis", "📜 Signal History", "🧭 Plan Tracker", "🔔 Notifications", "⚙️ Settings"])
 
 with tab1:
     st.header("🚀 Run AI Market Analysis")
     selected_symbols = st.multiselect("Select Symbols to Analyse", SYMBOLS, default=['XAUUSD', 'EURUSD', 'BTCUSD'])
-    uploaded_file = st.file_uploader("📸 Attach Market Chart Screenshot (Optional - AI will analyze price action)", type=["png", "jpg", "jpeg"])
-    
+    opt1, opt2 = st.columns(2)
+    force_new = opt1.checkbox("Force fresh plan (ignore plan lock)", value=False,
+                              help="Normally an existing valid plan is kept. Tick this only if you want the engine to rebuild from scratch.")
+    use_ai = opt2.checkbox("Use AI risk auditor (Groq)", value=True,
+                           help="The Python engine decides direction and levels. The AI only audits, flags risks, reads your screenshot and adjusts the score by at most ±6.")
+    uploaded_file = st.file_uploader("📸 Attach Market Chart Screenshot (Optional - the AI auditor will read it)", type=["png", "jpg", "jpeg"])
+
     image_b64 = None
     image_mime_type = 'image/png'
     if uploaded_file is not None:
@@ -3225,123 +2636,128 @@ with tab1:
         st.image(uploaded_file, caption="Uploaded Chart Snapshot", width=400)
 
     if st.button("🧠 Analyse Market Now", type="primary"):
-        if not get_secret("GROQ_API_KEY"):
-            st.error("⚠️ Please set your GROQ_API_KEY in Streamlit Secrets.")
-        else:
-            with st.spinner("Fetching market data and running institutional analysis..."):
-                all_data = fetch_all_data()
-                st.session_state.cached_market_data = all_data
-                
-                for symbol in selected_symbols:
-                    st.info(f"Analysing {symbol}...")
-                    result = analyze_symbol_premium(symbol, all_data, image_b64=image_b64, image_mime_type=image_mime_type)
-                    
-                    if 'error' in result:
-                        st.error(f"❌ {symbol}: {result['error']}")
-                        add_notification('warning', f"❌ {symbol}: {result['error']}", symbol=symbol)
+        if use_ai and not get_secret("GROQ_API_KEY"):
+            st.warning("GROQ_API_KEY is not set — running on the Python structure engine alone (direction and levels are unaffected; only the AI audit is skipped).")
+        load_state(force=True)
+        with st.spinner("Fetching market data and running top-down structure analysis..."):
+            all_data = fetch_all_data()
+            st.session_state.cached_market_data = all_data
+            for symbol in selected_symbols:
+                st.info(f"Analysing {symbol}...")
+                result = analyze_symbol_premium(symbol, all_data, image_b64=image_b64, image_mime_type=image_mime_type, force_new=force_new, use_ai=use_ai)
+                if 'error' in result:
+                    st.error(f"❌ {symbol}: {result['error']}")
+                    add_notification('warning', f"❌ {symbol}: {result['error']}", symbol=symbol)
+                    continue
+
+                api_status = result.get('api_status', 'UNKNOWN')
+                model_used = result.get('model_used', 'Unknown')
+                if api_status == 'ENGINE_ONLY':
+                    if result.get('plan_state') in ('REUSED', 'OPEN_TRADE_CONFLICT'):
+                        st.markdown("**🤖 Analysis:** existing locked plan re-checked against live price (no new AI call needed).")
                     else:
-                        # 🚨 DEBUGGING UI: Show API Status and Tokens
-                        api_status = result.get('api_status', 'UNKNOWN')
-                        model_used = result.get('model_used', 'Unknown')
-                        total_tokens = result.get('total_tokens', 0)
-                        prompt_tokens = result.get('prompt_tokens', 0)
-                        completion_tokens = result.get('completion_tokens', 0)
-                        rejection = result.get('rejection_reason', '')
-                        
-                        status_color = "green" if api_status in ['SUCCESS', 'SUCCESS_EXTRACTED', 'FALLBACK'] else "red"
-                        primary_ok = model_used == GROQ_MODELS[0] and api_status in ['SUCCESS', 'SUCCESS_EXTRACTED']
-                        model_badge = "🥇 primary" if primary_ok else ("⬇️ fallback model" if model_used in GROQ_MODELS else "")
-                        st.markdown(f"**🤖 AI Model:** `{model_used}` {model_badge} | **🔋 Tokens Used:** `{total_tokens}` (Prompt: {prompt_tokens}, Completion: {completion_tokens}) | **📡 Status:** <span style='color:{status_color}; font-weight:bold;'>{api_status}</span>", unsafe_allow_html=True)
+                        st.markdown(f"**🤖 Analysis:** `{model_used}`" + (f" — Groq unavailable ({result.get('groq_api_status')}): {result.get('groq_failure')}" if result.get('groq_failure') else ''))
+                else:
+                    primary_ok = model_used == GROQ_MODELS[0]
+                    badge = "🥇 primary" if primary_ok else ("⬇️ fallback model" if model_used in GROQ_MODELS else "")
+                    st.markdown(f"**🤖 AI auditor:** `{model_used}` {badge} | **🔋 Tokens:** `{result.get('total_tokens', 0)}` (Prompt: {result.get('prompt_tokens', 0)}, Completion: {result.get('completion_tokens', 0)})")
+                    attempts = st.session_state.last_model_attempts.get(symbol) or result.get('model_attempts')
+                    if attempts and (not primary_ok or any(a.get('status') != 'SUCCESS' for a in attempts)):
+                        with st.expander(f"🔎 Why {GROQ_MODELS[0]} wasn't the only model used"):
+                            for a in attempts:
+                                st.caption(f"`{a.get('model')}` → {a.get('status')}")
 
-                        attempts = st.session_state.last_model_attempts.get(symbol) or result.get('model_attempts')
-                        if attempts and (not primary_ok or any(a.get('status') not in ('SUCCESS',) for a in attempts)):
-                            with st.expander(f"🔎 Why {GROQ_MODELS[0]} wasn't used" if not primary_ok else "🔎 Model attempt log"):
-                                for a in attempts:
-                                    st.caption(f"`{a.get('model')}` → {a.get('status')}")
+                render_signal_card(symbol, result, all_data)
 
-                        if api_status == 'FALLBACK' and result.get('groq_failure'):
-                            st.warning(
-                                f"Groq unavailable ({result.get('groq_api_status', 'UNKNOWN')}): "
-                                f"{result['groq_failure']}"
-                            )
-                        
-                        if api_status not in ['SUCCESS', 'SUCCESS_EXTRACTED', 'FALLBACK']:
-                            with st.expander("🐛 Debug AI Response (Why it failed)"):
-                                st.code(result.get('raw_output', 'No raw output captured.'), language='json')
-                                st.error(f"Rejection Reason: {result.get('rejection_reason', 'Unknown')}")
-                        
-                        is_valid_logic, logic_reason = validate_ai_logic(result)
-                        if not is_valid_logic:
-                            st.info(f"⚪ {symbol}: Signal Rejected. AI Logic Flaw: {logic_reason}")
-                            add_notification('warning', f"⚪ {symbol}: Signal Rejected. AI Logic Flaw: {logic_reason}", symbol=symbol, signal=result.get('signal'))
-                            continue
-                        
-                        if result.get('signal') == 'WAIT':
-                            ai_reason = result.get('display_reasoning') or result.get('reasoning') or result.get('rejection_reason', 'Market conditions do not meet high-confidence criteria.')
-                            st.info(f"⚪ {symbol}: No Trade (WAIT). AI Reason: {ai_reason}")
-                            add_notification('info', f"⚪ {symbol}: No Trade (WAIT). AI Reason: {ai_reason}", symbol=symbol, signal='WAIT', score=result.get('confluence_score'))
-                            continue
-                        
-                        pair_config = get_pair_config(symbol)
-                        is_valid_math, math_reason = validate_signal_math(result, pair_config=pair_config)
-                        if not is_valid_math:
-                            st.info(f"⚪ {symbol}: Signal Rejected. AI Reason: {math_reason}")
-                            add_notification('warning', f"⚪ {symbol}: Signal Rejected. AI Reason: {math_reason}", symbol=symbol, signal=result.get('signal'))
-                            continue
-                        
-                        combined_score = result.get('confluence_score', 0)
-                        if result.get('signal') in ('BUY', 'SELL') and result.get('confidence') in ['HIGH', 'MEDIUM', 'LOW']:
-                            sig_color = "🟢" if result.get('signal') == "BUY" else "🔴"
-                            st.markdown(f"### {sig_color} **NEW SIGNAL:** {result.get('symbol', symbol)} - {result.get('signal')}")
-                            st.write(f"**DXY Correlation:** {result.get('dxy_correlation', 'N/A')}")
-                            st.write(f"**Microstructure:** {result.get('microstructure_read', 'N/A')}")
-                            st.write(f"**Visual Levels (Chart):** {result.get('visual_levels', 'N/A')}")
-                            st.info(f"**Entry (LIMIT):** {result.get('entry')} | **SL:** {result.get('stop_loss')} | **TP:** {result.get('take_profit')} | **R:R:** {result.get('rr_ratio', 'N/A')}")
-                            st.write(f"**Order Type:** {result.get('order_type', 'LIMIT')}")
-                            if result.get('order_description'):
-                                st.write(f"**Execution Plan:** {result.get('order_description')}")
-                            if result.get('next_level_watch'):
-                                st.write(f"**🔭 Next Level Watch:** {result.get('next_level_watch')}")
-                            st.write(f"**AI Reasoning:** {result.get('reasoning')}")
-                            validation_notes = result.get('python_validation_notes') or []
-                            if validation_notes:
-                                st.write(f"**Python Validation Notes:** {' '.join(validation_notes)}")
-                            st.markdown("---")
-                            
-                            st.session_state.active_signals[symbol] = {'direction': result.get('signal'), 'entry': result.get('entry', 0), 'timestamp': datetime.now(), 'score': combined_score}
-                            result['analyzed_at'] = datetime.now()
-                            st.session_state.signal_history.append(result)
-                            
-                            msg = build_telegram_signal_message(symbol, result)
-                            if send_telegram_message(msg):
-                                st.success("✅ Signal sent to Telegram!")
-                            add_notification('success', f"✅ {symbol}: New {result.get('signal')} signal accepted via {result.get('model_used', PYTHON_FALLBACK_MODEL)}. Score: {combined_score}/100. Entry: {result.get('entry')} | SL: {result.get('stop_loss')} | TP: {result.get('take_profit', ['N/A'])[0] if result.get('take_profit') else 'N/A'}.", symbol=symbol, signal=result.get('signal'), score=combined_score)
+                if result.get('plan_state') in ('NEW', 'REPLANNED'):
+                    ok_send, why = should_send_to_telegram(result)
+                    result['sent'] = False
+                    if ok_send:
+                        msg = build_telegram_signal_message(symbol, result)
+                        if send_telegram_message(msg):
+                            st.success("✅ Signal sent to Telegram!")
+                            result['sent'] = True
+                            mark_plan_sent(symbol)
                         else:
-                            ai_reason = result.get('display_reasoning') or result.get('reasoning') or result.get('rejection_reason', 'Low confidence or DXY contradiction')
-                            st.info(f"⚪ {symbol}: Signal Rejected. Score: {result.get('confluence_score', 0)}/100, Confidence: {result.get('confidence', 'N/A')}. AI Reason: {ai_reason}")
-                            add_notification('warning', f"⚪ {symbol}: Signal Rejected. Score: {result.get('confluence_score', 0)}/100, Confidence: {result.get('confidence', 'N/A')}. AI Reason: {ai_reason}", symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
+                            st.warning("Telegram send failed (check TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID). The plan is still locked in the tracker.")
+                    else:
+                        st.info(f"📭 Not pushed to Telegram: {why}. The plan is stored and tracked.")
+                    result['analyzed_at'] = datetime.now()
+                    st.session_state.signal_history.append(result)
+                    add_notification('success' if result['sent'] else 'info',
+                                     f"{symbol}: {result.get('plan_state')} {result.get('signal')} LIMIT {result.get('entry')} | SL {result.get('stop_loss')} | TP1 {(result.get('take_profit') or ['N/A'])[0]} | grade {result.get('grade')} ({result.get('confluence_score')}/100){'' if result['sent'] else ' — not pushed: ' + why}",
+                                     symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
+                st.markdown("---")
+        st.session_state.signal_history = st.session_state.signal_history[-200:]
 
 with tab2:
-    st.header("📜 Premium Signal History")
-    if not st.session_state.signal_history:
-        st.info("📭 No signals generated yet. Run an analysis in the Market Analysis tab.")
+    st.header("📜 Signal History (this session)")
+    history = st.session_state.signal_history
+    if not history:
+        st.info("📭 No new plans generated in this session yet. Run an analysis in the Market Analysis tab. (All plans, including from earlier sessions, are in the Plan Tracker.)")
     else:
-        premium_signals = [s for s in st.session_state.signal_history if s.get('confidence') == 'HIGH' and s.get('confluence_score', 0) >= 80]
-        st.metric("Total Premium Signals Logged", len(premium_signals))
-        for i, signal in enumerate(reversed(premium_signals)):
-            with st.expander(f"{'🟢' if signal.get('signal') == 'BUY' else '🔴'} {signal.get('symbol', 'N/A')} - {signal.get('signal')} | Score: {signal.get('confluence_score')}/100 | {signal.get('timestamp', 'N/A')}", expanded=False):
-                col_a, col_b, col_c = st.columns(3)
-                col_a.metric("Entry", signal.get('entry', 'N/A'))
-                col_b.metric("Stop Loss", signal.get('stop_loss', 'N/A'))
-                col_c.metric("Take Profit", signal.get('take_profit', ['N/A'])[0] if signal.get('take_profit') else 'N/A')
-                st.write(f"**Analysis model:** {signal.get('model_used', PYTHON_FALLBACK_MODEL)}")
-                st.write(f"**Tokens Used:** {signal.get('total_tokens', 'N/A')}")
-                st.write(f"**Bias:** {signal.get('bias')} | **Confidence:** {signal.get('confidence')}")
-                st.write(f"**DXY Correlation:** {signal.get('dxy_correlation', 'N/A')}")
+        sent_count = sum(1 for s in history if s.get('sent'))
+        h1c, h2c = st.columns(2)
+        h1c.metric("Plans generated", len(history))
+        h2c.metric("Pushed to Telegram", sent_count)
+        for signal in reversed(history):
+            cfg_h = get_pair_config(signal.get('symbol', 'XAUUSD'))
+            tp_list = signal.get('take_profit') or []
+            with st.expander(f"{'🟢' if signal.get('signal') == 'BUY' else '🔴'} {signal.get('symbol', 'N/A')} - {signal.get('signal')} | Grade {signal.get('grade', '-')} {signal.get('confluence_score')}/100 | {'sent' if signal.get('sent') else 'not sent'} | {signal.get('timestamp', 'N/A')}", expanded=False):
+                col_a, col_b, col_c, col_d = st.columns(4)
+                col_a.metric("Entry", _fmt(signal.get('entry'), cfg_h))
+                col_b.metric("Stop Loss", _fmt(signal.get('stop_loss'), cfg_h))
+                col_c.metric("TP1", _fmt(tp_list[0], cfg_h) if tp_list else 'N/A')
+                col_d.metric("TP2", _fmt(tp_list[1], cfg_h) if len(tp_list) > 1 else 'N/A')
+                st.write(f"**Zone:** {(signal.get('zone') or {}).get('kind')} · **Bias:** {signal.get('bias')} · **Confidence:** {signal.get('confidence')} · **DXY:** {signal.get('dxy_correlation', 'N/A')}")
+                st.write(f"**Analysis:** {signal.get('model_used', 'N/A')} · **Tokens:** {signal.get('total_tokens', 'N/A')}")
                 st.write(f"**Reasoning:** {signal.get('reasoning')}")
-                st.markdown("---")
 
 with tab3:
+    st.header("🧭 Plan Tracker")
+    st.caption("Every plan is created once and then tracked until it fills and resolves, is missed, expires, goes stale, or the HTF bias genuinely flips. State is saved to disk so it survives restarts of this session.")
+    tstate = load_state()
+    rcol1, rcol2 = st.columns([1, 1])
+    if rcol1.button("🔄 Refresh live plan statuses"):
+        with st.spinner("Checking live plans against the latest candles and quote..."):
+            _all = fetch_all_data()
+            changed = refresh_live_plans(_all)
+        st.success(f"Updated: {', '.join(changed)}" if changed else "No status changes.")
+        tstate = load_state()
+    stats = get_plan_stats()
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Closed plans", stats['total_closed'])
+    m2.metric("Wins / Losses", f"{stats['wins']} / {stats['losses']}")
+    m3.metric("Win rate", f"{stats['win_rate']:.0f}%" if stats['win_rate'] is not None else "—")
+    m4.metric("Net R", stats['total_r'])
+    m5.metric("Missed / Expired", f"{stats['missed']} / {stats['expired']}")
+    st.subheader("Live plans")
+    live_rows = []
+    for sym, plan in tstate['plans'].items():
+        if plan.get('status') in LIVE_PLAN_STATUSES:
+            cfg_t = get_pair_config(sym)
+            live_rows.append({'Symbol': sym, 'Side': plan.get('direction'), 'Status': plan.get('status'), 'Entry': _fmt(plan.get('entry'), cfg_t),
+                              'SL': _fmt(plan.get('stop_loss'), cfg_t), 'TP1': _fmt((plan.get('take_profit') or [None])[0], cfg_t),
+                              'Grade': plan.get('grade'), 'Sent': 'yes' if plan.get('sent') else 'no', 'Created (UTC)': str(plan.get('created_at', ''))[:16].replace('T', ' '),
+                              'Zone': (plan.get('zone') or {}).get('kind')})
+    if live_rows:
+        st.dataframe(pd.DataFrame(live_rows), hide_index=True, use_container_width=True)
+    else:
+        st.info("No live plans.")
+    st.subheader("Standing HTF bias per symbol")
+    bias_rows = [{'Symbol': s, 'Bias': b.get('direction'), 'Score': b.get('score'), 'Since (UTC)': str(b.get('since', ''))[:16].replace('T', ' ')} for s, b in tstate['bias'].items()]
+    if bias_rows:
+        st.dataframe(pd.DataFrame(bias_rows), hide_index=True, use_container_width=True)
+    else:
+        st.caption("No bias stored yet.")
+    st.subheader("Closed plan ledger")
+    ledger = tstate.get('ledger', [])
+    if ledger:
+        st.dataframe(pd.DataFrame(list(reversed(ledger)))[['symbol', 'direction', 'outcome', 'r', 'entry', 'stop_loss', 'tp1', 'rr', 'grade', 'score', 'zone', 'created_at', 'closed_at']], hide_index=True, use_container_width=True)
+    else:
+        st.caption("No closed plans yet.")
+
+with tab4:
     st.header("🔔 Notifications")
     if not st.session_state.notifications:
         st.info("📭 No notifications yet.")
@@ -3353,7 +2769,6 @@ with tab3:
             if st.button("🗑️ Clear All", use_container_width=True):
                 clear_notifications()
                 st.rerun()
-        
         notifications = get_notifications()
         filtered_notifications = list(reversed(notifications))
         if filter_type == "Signals Only":
@@ -3364,7 +2779,6 @@ with tab3:
             filtered_notifications = [n for n in filtered_notifications if n.get('type') == 'info']
         elif filter_type == "Success":
             filtered_notifications = [n for n in filtered_notifications if n.get('type') == 'success']
-        
         if not filtered_notifications:
             st.info("📭 No notifications match the current filter.")
         else:
@@ -3387,27 +2801,35 @@ with tab3:
                 else:
                     st.info(f"{header}\n{note.get('message', '')}")
 
-with tab4:
+with tab5:
     st.header("⚙️ System Settings")
     st.info("Ensure `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are set in your Streamlit Secrets.")
-    st.markdown(f"- **AI Model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
-    st.markdown("- **Execution:** All signals are resting LIMIT orders at a structural pullback level — no market or stop entries, no WAIT signals")
-    st.markdown("- **Execution:** Manual trigger only (No auto-loop)")
-    st.markdown("- **Features:** SMC, BOS/CHOCH, FVG, Order Blocks, Liquidity Sweeps, DXY Correlation, Regime Filter (ADX), Multi-Strategy Confluence")
-    st.markdown(f"- **Minimum Confluence Score:** {MINIMUM_CONFLUENCE_SCORE}/100")
-    st.markdown("- **Chart Screenshot:** Upload market charts for AI to analyze alongside data")
-
+    st.markdown("**How a signal is decided now**")
+    st.markdown(
+        "1. **Direction = H4 + H1 only.** Confirmed pivots, HH/HL/LH/LL, close-based BOS/CHOCH, EMA trend and RSI regime. M10/M15/M30 have no vote.\n"
+        f"2. **Hysteresis.** A standing bias only flips with a score beyond ±{BIAS_FLIP_THRESHOLD:.0f}, an opposing H1/H4 close-based structure break, and at least {BIAS_MIN_HOLD_HOURS:.0f}h since it was set.\n"
+        "3. **Entry = best HTF zone.** Unmitigated H4/H1 order blocks, open FVGs, 62–79% OTE, live swings, equal highs/lows and PDH/PDL/PWH/PWL are ranked by timeframe, confluence, freshness, location and distance; M30/M15 then refine the limit *inside* the zone.\n"
+        "4. **SL/TP are structural.** SL beyond the zone's distal edge (and any live swing just beyond) with an H1-ATR buffer; TP1/TP2 are the next opposing HTF levels that pay at least 1.5R.\n"
+        "5. **Plan lock.** One plan per symbol is created and managed until it resolves — reruns return the same plan.\n"
+        "6. **AI is an auditor.** It cannot change direction or levels; it flags risks, reads screenshots and adjusts the score by ±6."
+    )
+    st.markdown(f"- **AI model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
+    st.markdown("- **Execution:** resting LIMIT orders only · manual trigger only (no auto-loop)")
+    st.markdown(f"- **State file:** `{STATE_PATH}` (set `DERAI_STATE_PATH` to change it; on Streamlit Community Cloud the disk resets when the app is rebuilt/restarted)")
+    st.markdown("---")
+    st.subheader("Telegram & scoring controls")
+    st.slider("Minimum score to push a signal to Telegram", 60, 90, MINIMUM_CONFLUENCE_SCORE, key="min_send_score")
+    st.checkbox("Also push low-conviction plans (below the threshold / ATR fallback)", value=False, key="send_low_conviction")
+    st.checkbox("Send plan events (filled / TP / SL / cancelled / missed / expired) to Telegram", value=True, key="notify_plan_events")
+    if st.button("🧹 Reset stored bias, plans and ledger"):
+        reset_state()
+        st.success("Stored bias, plans and ledger cleared.")
     st.markdown("---")
     st.subheader("🔧 Groq Model Diagnostics")
-    st.caption(
-        "GROQ_MODELS is always tried in the order below — this app no longer lets Groq's "
-        "model-discovery endpoint silently reorder or drop the primary model. Use this panel "
-        "if the primary model still isn't being used, to see what your account/key actually "
-        "reports as available."
-    )
+    st.caption("GROQ_MODELS is always tried in the order below. Use this panel to see what your key reports as available.")
     for m in GROQ_MODELS:
-        cfg = GROQ_MODEL_CONFIG.get(m, GROQ_DEFAULT_MODEL_CONFIG)
-        st.write(f"**{m}** — max_completion_tokens={cfg['max_completion_tokens']}, reasoning_effort={cfg.get('reasoning_effort')}")
+        cfg_m = GROQ_MODEL_CONFIG.get(m, GROQ_DEFAULT_MODEL_CONFIG)
+        st.write(f"**{m}** — max_completion_tokens={cfg_m['max_completion_tokens']}, reasoning_effort={cfg_m.get('reasoning_effort')}")
     if st.button("Check Groq /models endpoint now"):
         api_key = get_secret("GROQ_API_KEY", "").strip()
         if not api_key:
@@ -3420,13 +2842,12 @@ with tab4:
                     if m in available:
                         st.success(f"✅ {m} — reported available by Groq")
                     else:
-                        st.warning(f"⚠️ {m} — NOT reported by Groq's /models endpoint right now (the app will still try it; a live HTTP error at call time is the authoritative signal, not this list)")
+                        st.warning(f"⚠️ {m} — NOT reported by Groq's /models endpoint right now (the app will still try it)")
             else:
                 st.error(f"Could not reach Groq /models endpoint: {discovery.get('reason')}")
     last_attempts = st.session_state.get('last_model_attempts') or {}
     if last_attempts:
         st.markdown("**Last analysis run — per-symbol model attempts:**")
         for sym, attempts in last_attempts.items():
-            if not attempts:
-                continue
-            st.write(f"`{sym}`: " + " → ".join(f"{a.get('model')}:{a.get('status')}" for a in attempts))
+            if attempts:
+                st.write(f"`{sym}`: " + " → ".join(f"{a.get('model')}:{a.get('status')}" for a in attempts))
