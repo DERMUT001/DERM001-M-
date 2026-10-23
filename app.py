@@ -1009,11 +1009,139 @@ def calculate_microstructure(df):
             "vwap": round(vwap, 5 if price < 10 else 2),
             "price_vs_vwap": "ABOVE" if price > vwap else "BELOW",
             "rvol": round(rvol, 2),
-            "volume_anomaly": "HIGH_INSTITUTIONAL" if rvol > 2.0 else "NORMAL",
+            "volume_anomaly": "HIGH_RELATIVE_VOLUME" if rvol > 2.0 else "NORMAL",
             "momentum": "BULLISH" if price_change > 0 else "BEARISH",
+            "volume_analysis": calculate_volume_analysis(d),
         }
     except Exception:
         return {}
+
+def calculate_volume_analysis(df, lookback=120, profile_bins=24):
+    """Estimate volume-at-price and candle pressure from OHLCV; neither is true trade delta."""
+    unavailable = {
+        'available': False, 'net_volume_proxy_pct': None, 'net_volume_proxy_side': 'UNAVAILABLE',
+        'rvol': None, 'profile': {}, 'source': 'OHLCV close-location proxy; no bid/ask trade data'
+    }
+    if df is None or df.empty or 'Volume' not in df.columns:
+        return unavailable
+    d = closed_candles(df).tail(lookback).copy()
+    if d.empty:
+        return unavailable
+    try:
+        high = pd.to_numeric(d['High'], errors='coerce').to_numpy(dtype=float)
+        low = pd.to_numeric(d['Low'], errors='coerce').to_numpy(dtype=float)
+        close = pd.to_numeric(d['Close'], errors='coerce').to_numpy(dtype=float)
+        open_price = pd.to_numeric(d['Open'], errors='coerce').to_numpy(dtype=float)
+        volume = pd.to_numeric(d['Volume'], errors='coerce').fillna(0).clip(lower=0).to_numpy(dtype=float)
+        valid = np.isfinite(high) & np.isfinite(low) & np.isfinite(close) & np.isfinite(open_price) & np.isfinite(volume)
+        high, low, close, open_price, volume = (values[valid] for values in (high, low, close, open_price, volume))
+        if len(volume) < 5 or volume.sum() <= 0:
+            return unavailable
+
+        candle_range = high - low
+        close_location = np.divide(2 * (close - low), candle_range, out=np.sign(close - open_price), where=candle_range > 0) - np.where(candle_range > 0, 1.0, 0.0)
+        # With valid ranges, close_location is in [-1, 1]. Zero-range bars use candle direction.
+        close_location = np.clip(close_location, -1.0, 1.0)
+        recent_volume = volume[-20:]
+        recent_delta = float(np.sum(recent_volume * close_location[-20:]))
+        recent_total = float(recent_volume.sum())
+        delta_pct = 100.0 * recent_delta / recent_total if recent_total > 0 else 0.0
+        prior_volume = volume[-21:-1]
+        rvol = float(volume[-1] / prior_volume.mean()) if len(prior_volume) and prior_volume.mean() > 0 else None
+
+        typical_price = (high + low + close) / 3.0
+        price_low, price_high = float(np.min(low)), float(np.max(high))
+        if price_high <= price_low:
+            return unavailable
+        bins = min(profile_bins, max(8, int(np.sqrt(len(volume)) * 2)))
+        edges = np.linspace(price_low, price_high, bins + 1)
+        volume_by_price, _ = np.histogram(typical_price, bins=edges, weights=volume)
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        poc_idx = int(np.argmax(volume_by_price))
+        value_area_left = value_area_right = poc_idx
+        value_area_volume = float(volume_by_price[poc_idx])
+        target_volume = float(volume_by_price.sum()) * 0.70
+        while value_area_volume < target_volume and (value_area_left > 0 or value_area_right < len(volume_by_price) - 1):
+            left_volume = volume_by_price[value_area_left - 1] if value_area_left > 0 else -1
+            right_volume = volume_by_price[value_area_right + 1] if value_area_right < len(volume_by_price) - 1 else -1
+            if right_volume > left_volume:
+                value_area_right += 1
+                value_area_volume += float(right_volume)
+            else:
+                value_area_left -= 1
+                value_area_volume += float(left_volume)
+        side = 'BUYERS' if delta_pct >= 8 else 'SELLERS' if delta_pct <= -8 else 'BALANCED'
+        return {
+            'available': True,
+            'net_volume_proxy_pct': round(delta_pct, 1),
+            'net_volume_proxy_side': side,
+            'rvol': round(rvol, 2) if rvol is not None else None,
+            'profile': {
+                'poc': float(centers[poc_idx]),
+                'val': float(edges[value_area_left]),
+                'vah': float(edges[value_area_right + 1]),
+                'lookback_bars': len(volume),
+            },
+            'source': 'OHLCV close-location proxy; no bid/ask trade data',
+        }
+    except Exception:
+        return unavailable
+
+def score_volume_zone(snap, zone, direction, atr):
+    """Score local volume context conservatively; pressure is an OHLCV proxy, not order-flow delta."""
+    if not snap or snap.get('df') is None:
+        return 4.0, 'volume unavailable; neutral score', {}
+    d = snap['df'].tail(120)
+    micro = snap.get('micro') or {}
+    analysis = micro.get('volume_analysis') or {}
+    if not analysis.get('available') or 'Volume' not in d.columns:
+        return 4.0, 'volume unavailable; neutral score', {}
+    try:
+        bottom, top = sorted((float(zone['bottom']), float(zone['top'])))
+        high = pd.to_numeric(d['High'], errors='coerce').to_numpy(dtype=float)
+        low = pd.to_numeric(d['Low'], errors='coerce').to_numpy(dtype=float)
+        close = pd.to_numeric(d['Close'], errors='coerce').to_numpy(dtype=float)
+        open_price = pd.to_numeric(d['Open'], errors='coerce').to_numpy(dtype=float)
+        volume = pd.to_numeric(d['Volume'], errors='coerce').fillna(0).clip(lower=0).to_numpy(dtype=float)
+        ranges = high - low
+        overlap = np.maximum(0.0, np.minimum(high, top) - np.maximum(low, bottom))
+        fractions = np.divide(overlap, ranges, out=np.zeros_like(overlap), where=ranges > 0)
+        zero_range_inside = (ranges <= 0) & (close >= bottom) & (close <= top)
+        fractions[zero_range_inside] = 1.0
+        allocated_volume = volume * fractions
+        total_volume = float(volume.sum())
+        zone_volume = float(allocated_volume.sum())
+        close_location = np.divide(2 * (close - low), ranges, out=np.sign(close - open_price), where=ranges > 0) - np.where(ranges > 0, 1.0, 0.0)
+        delta = float(np.sum(allocated_volume * np.clip(close_location, -1.0, 1.0)))
+        delta_pct = 100.0 * delta / zone_volume if zone_volume > 0 else 0.0
+        volume_share_pct = 100.0 * zone_volume / total_volume if total_volume > 0 else 0.0
+
+        score = 0.0
+        aligned_delta = delta_pct if direction == 'BUY' else -delta_pct
+        score += 3.0 if aligned_delta >= 20 else 2.0 if aligned_delta >= 8 else 1.0 if aligned_delta > 0 else 0.0
+        score += 2.0 if volume_share_pct >= 20 else 1.0 if volume_share_pct >= 8 else 0.0
+        profile = analysis.get('profile') or {}
+        poc, val, vah = profile.get('poc'), profile.get('val'), profile.get('vah')
+        entry = float(zone.get('entry', (bottom + top) / 2.0))
+        if poc is not None and bottom <= float(poc) <= top:
+            score += 3.0
+            profile_relation = 'zone contains POC'
+        elif val is not None and vah is not None and bottom <= float(vah) and top >= float(val):
+            score += 2.0
+            profile_relation = 'zone overlaps value area'
+        elif poc is not None and atr and abs(entry - float(poc)) <= 0.5 * atr:
+            score += 1.0
+            profile_relation = 'entry near POC'
+        else:
+            profile_relation = 'zone outside value area'
+        details = {
+            'zone_delta_proxy_pct': round(delta_pct, 1),
+            'zone_volume_share_pct': round(volume_share_pct, 1),
+            'profile_relation': profile_relation,
+        }
+        return min(8.0, score), f"{profile_relation}; zone pressure proxy {delta_pct:+.1f}%; volume share {volume_share_pct:.1f}%", details
+    except Exception:
+        return 4.0, 'volume calculation unavailable; neutral score', {}
 
 def ema_trend(d, atr):
     try:
@@ -1881,11 +2009,16 @@ def score_plan(direction, plan, zone, bias, snaps, dxy_rel, regime, ltf_snaps, p
     if bias['low_conviction']:
         align *= 0.4
     b['HTF alignment (H4+H1)'] = round(align, 1)
-    b['Zone quality & confluence'] = round(min(25.0, zone.get('zone_score', 0) * 4.0), 1)
+    b['Zone quality & confluence'] = round(min(20.0, zone.get('zone_score', 0) * 3.2), 1)
     ref = (snaps.get('H4') or snaps.get('H1'))['range']
     pos = range_pos(ref, plan['entry'])
     depth = pos if buy else 1.0 - pos
-    b['Premium/discount location'] = 15.0 if depth <= 0.35 else 11.0 if depth <= 0.5 else 6.0 if depth <= 0.62 else 2.0
+    b['Premium/discount location'] = 12.0 if depth <= 0.35 else 9.0 if depth <= 0.5 else 5.0 if depth <= 0.62 else 2.0
+    volume_zone = dict(zone)
+    volume_zone['entry'] = plan['entry']
+    volume_score, volume_detail, volume_metrics = score_volume_zone(snaps.get('H1'), volume_zone, direction, atr_h1)
+    b['Volume profile & pressure proxy'] = round(volume_score, 1)
+    volume_evidence = {'score': round(volume_score, 1), 'detail': volume_detail, **volume_metrics}
     ltf = 0.0
     candle_notes = []
     if plan.get('ltf_refs'):
@@ -1924,7 +2057,7 @@ def score_plan(direction, plan, zone, bias, snaps, dxy_rel, regime, ltf_snaps, p
     b['Macro (DXY) & regime'] = round(macro, 1)
     b['Structural targets'] = (3.0 if plan.get('tp1_structural') else 0.0) + (2.0 if plan.get('tp2_structural') else 0.0)
     total = int(round(sum(b.values())))
-    return max(0, min(100, total)), b, candle_notes
+    return max(0, min(100, total)), b, candle_notes, volume_evidence
 
 def grade_for(score):
     return 'A' if score >= 85 else 'B' if score >= 75 else 'C' if score >= 65 else 'D'
@@ -1950,10 +2083,11 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
                'zone_score': z['zone_score'], 'dist_atr': z['dist_atr'], 'touches': z['touches'], 'confluence': z['confluence'],
                'valid': plan is not None, 'reason': reason}
         if plan is not None:
-            score, breakdown, candle_notes = score_plan(direction, plan, z, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
+            score, breakdown, candle_notes, volume_evidence = score_plan(direction, plan, z, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
             plan['zone'] = {'kind': z['kind'], 'tf': z['tf'], 'top': z['top'], 'bottom': z['bottom'],
                             'touches': z['touches'], 'confluence': z['confluence'], 'zone_score': z['zone_score']}
             plan['score'], plan['score_breakdown'], plan['candle_notes'] = score, breakdown, candle_notes
+            plan['volume_confirmation'] = volume_evidence
             row['score'] = score
             valid.append(plan)
         audit.append(row)
@@ -1975,8 +2109,9 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
                 'tp2_kind': 'R-multiple projection', 'tp1_structural': False, 'tp2_structural': False, 'ltf_refs': [], 'order_type': 'LIMIT'}
     plan['zone'] = {'kind': fake_zone['kind'], 'tf': 'H1', 'top': fake_zone['top'], 'bottom': fake_zone['bottom'],
                     'touches': 0, 'confluence': [], 'zone_score': 0.0}
-    score, breakdown, candle_notes = score_plan(direction, plan, fake_zone, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
+    score, breakdown, candle_notes, volume_evidence = score_plan(direction, plan, fake_zone, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
     plan['score'], plan['score_breakdown'], plan['candle_notes'] = min(score, 60), breakdown, candle_notes
+    plan['volume_confirmation'] = volume_evidence
     plan['source'] = 'ATR_FALLBACK'
     return plan, audit
 
@@ -2181,6 +2316,8 @@ def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy
                           f"{row['dist_atr']} ATR away, {'VALID' if row['valid'] else 'rejected: ' + row['reason']}")
     lv = ', '.join(f"{k} {_fmt(v, cfg)}" for k, v in levels.items()) or 'n/a'
     m10 = snaps.get('_micro_m10') or {}
+    h1_volume = ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {}
+    h1_profile = h1_volume.get('profile') or {}
     m10_candles = snaps.get('_candles_m10') or []
     m10_pattern = m10_candles[-1]['pattern'] if m10_candles else 'n/a'
     body = f"""You are the risk auditor of an institutional trading desk. A deterministic Python engine has ALREADY decided direction and exact levels using strict top-down analysis (H4/H1 decide direction; M30/M15 only refine the limit price inside the HTF zone). You may NOT change direction, entry, stop or target. Your job is to sanity-check the plan, use the chart screenshot if one is attached, flag concrete risks, and write a concise rationale.
@@ -2188,6 +2325,7 @@ def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy
 SYMBOL: {symbol} | LIVE PRICE: {_fmt(live_price, cfg)}
 LOCKED PLAN: {plan['direction']} LIMIT | entry {_fmt(plan['entry'], cfg)} | SL {_fmt(plan['stop_loss'], cfg)} | TP1 {_fmt(plan['take_profit'][0], cfg)} ({plan['tp1_kind']}) | TP2 {_fmt(plan['take_profit'][1], cfg)} | R:R {plan['rr_ratio']}
 CHOSEN ZONE: {plan['zone']['kind']} {_fmt(plan['zone']['bottom'], cfg)}-{_fmt(plan['zone']['top'], cfg)}; confluence: {', '.join(plan['zone'].get('confluence') or []) or 'none'}; LTF refinement: {', '.join(plan.get('ltf_refs') or []) or 'none'}
+CHOSEN ZONE VOLUME CONFIRMATION: {json.dumps(plan.get('volume_confirmation') or {})}
 PYTHON SCORE: {plan['score']}/100 -> {json.dumps(plan['score_breakdown'])}
 HTF BIAS ({bias['word']}, score {bias['score']:+.0f}): {' | '.join(bias['evidence'][:8])}. {' '.join(bias['notes'])}
 H4: {describe_snapshot(snaps.get('H4'), cfg)}
@@ -2195,6 +2333,8 @@ H1: {describe_snapshot(snaps.get('H1'), cfg)}
 M30: {describe_snapshot(snaps.get('M30'), cfg)}
 M15: {describe_snapshot(snaps.get('M15'), cfg)}
 M10 MICRO: VWAP {m10.get('vwap', 'n/a')} | price vs VWAP {m10.get('price_vs_vwap', 'n/a')} | RVOL {m10.get('rvol', 'n/a')} | momentum {m10.get('momentum', 'n/a')} | last candle {m10_pattern}
+H1 VOLUME: {h1_volume.get('net_volume_proxy_side', 'UNAVAILABLE')} pressure proxy {h1_volume.get('net_volume_proxy_pct', 'n/a')}% over the last 20 closed bars | RVOL {h1_volume.get('rvol', 'n/a')} | volume profile POC {h1_profile.get('poc', 'n/a')}, VAL {h1_profile.get('val', 'n/a')}, VAH {h1_profile.get('vah', 'n/a')} ({h1_profile.get('lookback_bars', 0)} bars)
+VOLUME DATA LIMIT: Volume pressure and volume-at-price are estimates derived from OHLCV candles, not exchange bid/ask delta or a true traded volume profile. Do not describe the proxy as confirmed buyer/seller order flow; unavailable volume is not bearish or bullish.
 KEY LEVELS: {lv}
 DXY: {dxy.get('detail')} -> relation to this trade: {dxy_rel}
 RANKED HTF ENTRY CANDIDATES:
@@ -2300,6 +2440,8 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         'python_validation_notes': notes, 'risk_flags': risk_flags, 'market_closed': market_closed,
         'regime': (regime or {}).get('regime'), 'atr': atr_h1, 'live_price': live_price,
         'dxy_summary': dxy.get('detail'), 'ai_used': ai_used,
+        'volume_analysis': ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {},
+        'volume_confirmation': plan.get('volume_confirmation') or {},
         'microstructure_read': (ai.get('microstructure_read') if ai_used and ai.get('microstructure_read') else
                                 'VWAP {} | RVOL {} | momentum {} | last candle {}'.format(
                                     *[(snaps.get('_micro_m10') or {}).get(k, 'n/a') for k in ('price_vs_vwap', 'rvol', 'momentum')],
@@ -2501,13 +2643,35 @@ def plot_plan_chart(h1_df, result, bars=110):
     if d is None or d.empty:
         return None
     d = d.tail(bars)
-    fig, ax = plt.subplots(figsize=(10, 4.3))
+    fig, (ax, volume_ax) = plt.subplots(2, 1, figsize=(10, 5.7), sharex=True,
+                                       gridspec_kw={'height_ratios': [4, 1]})
     o, h, l, c = (d[k].to_numpy(dtype=float) for k in ('Open', 'High', 'Low', 'Close'))
     span = max(float(h.max() - l.min()), 1e-9)
     for i in range(len(d)):
         color = '#10b981' if c[i] >= o[i] else '#ef4444'
         ax.vlines(i, l[i], h[i], color=color, linewidth=0.8)
         ax.add_patch(Rectangle((i - 0.3, min(o[i], c[i])), 0.6, max(abs(c[i] - o[i]), span * 0.0008), color=color))
+    ranges = h - l
+    pressure_proxy = np.divide(2 * (c - l), ranges, out=np.sign(c - o), where=ranges > 0) - np.where(ranges > 0, 1.0, 0.0)
+    volume = pd.to_numeric(d.get('Volume', pd.Series(0.0, index=d.index)), errors='coerce').fillna(0).to_numpy(dtype=float)
+    signed_volume_proxy = volume * np.clip(pressure_proxy, -1.0, 1.0)
+    proxy_colors = ['#10b981' if value >= 0 else '#ef4444' for value in signed_volume_proxy]
+    volume_ax.bar(np.arange(len(d)), signed_volume_proxy, color=proxy_colors, width=0.65, alpha=0.8)
+    volume_ax.axhline(0, color='#6b7280', linewidth=0.7)
+    volume_ax.set_ylabel('Net vol.\nproxy', fontsize=8)
+    volume_ax.grid(axis='y', alpha=0.15)
+    volume_ax.tick_params(axis='y', labelsize=7)
+    volume_metrics = calculate_volume_analysis(d)
+    profile = volume_metrics.get('profile') or {}
+    profile_lines = [
+        ('POC', profile.get('poc'), '#fbbf24', '-.'),
+        ('VAL', profile.get('val'), '#a78bfa', ':'),
+        ('VAH', profile.get('vah'), '#a78bfa', ':'),
+    ]
+    for name, value, color, style in profile_lines:
+        if value is not None:
+            ax.axhline(float(value), color=color, linestyle=style, linewidth=0.9, alpha=0.9)
+            ax.text(len(d) + 0.5, float(value), f' {name}', color=color, fontsize=7, va='center')
     zone = result.get('zone') or {}
     if zone.get('top') is not None:
         ax.axhspan(zone['bottom'], zone['top'], color='#3b82f6', alpha=0.18, label='HTF entry zone')
@@ -2534,6 +2698,10 @@ def plot_plan_chart(h1_df, result, bars=110):
     ax.set_title(f"{result.get('symbol', '')} H1 — {result.get('signal')} LIMIT plan", fontsize=10)
     ax.grid(alpha=0.15)
     ax.set_xticks([])
+    volume_ax.set_xlim(-1, len(d) + 14)
+    volume_ax.set_xticks([])
+    fig.text(0.99, 0.015, 'Volume pressure is an OHLCV close-location proxy, not bid/ask delta.',
+             ha='right', fontsize=7, color='#6b7280')
     fig.tight_layout()
     return fig
 
@@ -2578,6 +2746,18 @@ def render_signal_card(symbol, result, all_data):
         st.write(f"**📍 Entry zone:** {zone.get('kind')} {_fmt(zone.get('bottom'), cfg)}–{_fmt(zone.get('top'), cfg)}{conf}")
     st.write(f"**Stop anchor:** {result.get('sl_anchor')} · **TP1:** {result.get('tp1_kind')} · **TP2:** {result.get('tp2_kind')}")
     st.write(f"**DXY correlation:** {result.get('dxy_correlation', 'N/A')} · **Regime (H1):** {result.get('regime', 'n/a')} · **Microstructure:** {result.get('microstructure_read', 'N/A')}")
+    with st.expander('📊 Volume profile & pressure evidence'):
+        volume = result.get('volume_analysis') or {}
+        profile = volume.get('profile') or {}
+        if volume.get('available'):
+            st.write(f"**H1 pressure proxy:** {volume.get('net_volume_proxy_side')} {volume.get('net_volume_proxy_pct'):+.1f}% · **RVOL:** {volume.get('rvol', 'n/a')}")
+            st.write(f"**Volume profile:** POC {_fmt(profile.get('poc'), cfg)} · VAL {_fmt(profile.get('val'), cfg)} · VAH {_fmt(profile.get('vah'), cfg)} · {profile.get('lookback_bars', 0)} closed bars")
+            confirmation = result.get('volume_confirmation') or {}
+            if confirmation:
+                st.write(f"**Selected-zone evidence:** {confirmation.get('detail', 'n/a')} · score {confirmation.get('score', 0)}/8")
+            st.caption('Profile assigns each candle volume to its typical price; pressure estimates candle-level buying/selling from close location. Neither is true bid/ask order flow.')
+        else:
+            st.info('Usable volume data is unavailable for this feed; volume was treated as neutral in candidate scoring.')
     if result.get('order_description'):
         st.write(f"**Execution plan:** {result.get('order_description')}")
     if result.get('invalidation'):
