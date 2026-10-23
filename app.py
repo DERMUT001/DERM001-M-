@@ -1046,10 +1046,31 @@ def calculate_volume_analysis(df, lookback=120, profile_bins=24):
         recent_delta = float(np.sum(recent_volume * close_location[-20:]))
         recent_total = float(recent_volume.sum())
         delta_pct = 100.0 * recent_delta / recent_total if recent_total > 0 else 0.0
+        body_direction = np.sign(close - open_price)
+        body_pressure_pct = 100.0 * float(np.sum(recent_volume * body_direction[-20:])) / recent_total if recent_total > 0 else 0.0
+        close_direction = np.sign(np.diff(close, prepend=close[0]))
+        obv_steps = volume * close_direction
+        obv = np.cumsum(obv_steps)
+        obv_start = max(0, len(obv) - 11)
+        obv_base_volume = float(volume[-20:].sum())
+        obv_trend_pct = 100.0 * float(obv[-1] - obv[obv_start]) / obv_base_volume if obv_base_volume > 0 else 0.0
+        recent_cmf = 100.0 * float(np.sum(recent_volume * close_location[-20:])) / recent_total if recent_total > 0 else 0.0
+        typical_price = (high + low + close) / 3.0
+        money_flow = typical_price * volume
+        typical_change = np.diff(typical_price, prepend=typical_price[0])
+        positive_flow = float(money_flow[-14:][typical_change[-14:] > 0].sum())
+        negative_flow = float(money_flow[-14:][typical_change[-14:] < 0].sum())
+        mfi = (50.0 if positive_flow == 0 and negative_flow == 0 else
+               100.0 if negative_flow == 0 else
+               0.0 if positive_flow == 0 else
+               100.0 - 100.0 / (1.0 + positive_flow / negative_flow))
+        delta_half = max(1, len(recent_volume) // 2)
+        earlier_delta = float(np.sum(recent_volume[:-delta_half] * close_location[-len(recent_volume):-delta_half])) if len(recent_volume) > delta_half else 0.0
+        later_delta = float(np.sum(recent_volume[-delta_half:] * close_location[-delta_half:]))
+        delta_trend_pct = 100.0 * (later_delta - earlier_delta) / recent_total if recent_total > 0 else 0.0
         prior_volume = volume[-21:-1]
         rvol = float(volume[-1] / prior_volume.mean()) if len(prior_volume) and prior_volume.mean() > 0 else None
 
-        typical_price = (high + low + close) / 3.0
         price_low, price_high = float(np.min(low)), float(np.max(high))
         if price_high <= price_low:
             return unavailable
@@ -1076,6 +1097,12 @@ def calculate_volume_analysis(df, lookback=120, profile_bins=24):
             'net_volume_proxy_pct': round(delta_pct, 1),
             'net_volume_proxy_side': side,
             'rvol': round(rvol, 2) if rvol is not None else None,
+            'body_pressure_pct': round(body_pressure_pct, 1),
+            'obv_trend_pct': round(float(np.clip(obv_trend_pct, -100.0, 100.0)), 1),
+            'cmf20_pct': round(recent_cmf, 1),
+            'mfi14': round(float(mfi), 1),
+            'delta_trend_pct': round(delta_trend_pct, 1),
+            'bar_minutes': infer_bar_minutes(d),
             'profile': {
                 'poc': float(centers[poc_idx]),
                 'val': float(edges[value_area_left]),
@@ -1088,14 +1115,14 @@ def calculate_volume_analysis(df, lookback=120, profile_bins=24):
         return unavailable
 
 def score_volume_zone(snap, zone, direction, atr):
-    """Score local volume context conservatively; pressure is an OHLCV proxy, not order-flow delta."""
+    """Measure participation, directional pressure, and rejection at one candidate zone."""
     if not snap or snap.get('df') is None:
-        return 4.0, 'volume unavailable; neutral score', {}
+        return None
     d = snap['df'].tail(120)
     micro = snap.get('micro') or {}
     analysis = micro.get('volume_analysis') or {}
     if not analysis.get('available') or 'Volume' not in d.columns:
-        return 4.0, 'volume unavailable; neutral score', {}
+        return None
     try:
         bottom, top = sorted((float(zone['bottom']), float(zone['top'])))
         high = pd.to_numeric(d['High'], errors='coerce').to_numpy(dtype=float)
@@ -1106,42 +1133,149 @@ def score_volume_zone(snap, zone, direction, atr):
         ranges = high - low
         overlap = np.maximum(0.0, np.minimum(high, top) - np.maximum(low, bottom))
         fractions = np.divide(overlap, ranges, out=np.zeros_like(overlap), where=ranges > 0)
-        zero_range_inside = (ranges <= 0) & (close >= bottom) & (close <= top)
-        fractions[zero_range_inside] = 1.0
+        inside_flat_bar = (ranges <= 0) & (close >= bottom) & (close <= top)
+        fractions[inside_flat_bar] = 1.0
         allocated_volume = volume * fractions
         total_volume = float(volume.sum())
         zone_volume = float(allocated_volume.sum())
+        if total_volume <= 0 or zone_volume <= 0:
+            return None
         close_location = np.divide(2 * (close - low), ranges, out=np.sign(close - open_price), where=ranges > 0) - np.where(ranges > 0, 1.0, 0.0)
-        delta = float(np.sum(allocated_volume * np.clip(close_location, -1.0, 1.0)))
-        delta_pct = 100.0 * delta / zone_volume if zone_volume > 0 else 0.0
-        volume_share_pct = 100.0 * zone_volume / total_volume if total_volume > 0 else 0.0
+        zone_delta_pct = 100.0 * float(np.sum(allocated_volume * np.clip(close_location, -1.0, 1.0))) / zone_volume
+        zone_body_pct = 100.0 * float(np.sum(allocated_volume * np.sign(close - open_price))) / zone_volume
+        volume_share_pct = 100.0 * zone_volume / total_volume
+        touched = allocated_volume > 0
+        zone_rvol = float(np.mean(allocated_volume[touched]) / np.mean(volume)) if touched.any() and np.mean(volume) > 0 else 0.0
+        rejection = (close > top) if direction == 'BUY' else (close < bottom)
+        rejection_volume_pct = 100.0 * float(allocated_volume[rejection].sum()) / zone_volume
+        recent_volume = volume[-20:]
+        recent_body_direction = np.sign((close - open_price)[-20:])
+        intended_sign = 1.0 if direction == 'BUY' else -1.0
+        impulse_volume = recent_volume[recent_body_direction == intended_sign]
+        pullback_volume = recent_volume[recent_body_direction == -intended_sign]
+        pullback_volume_ratio = (float(np.mean(pullback_volume) / np.mean(impulse_volume))
+                                 if len(pullback_volume) and len(impulse_volume) and np.mean(impulse_volume) > 0 else None)
+        if pullback_volume_ratio is None:
+            pullback_read, pullback_points = 'no recent countertrend sample', 1.0
+        elif pullback_volume_ratio <= 0.8:
+            pullback_read, pullback_points = 'countertrend pullback volume lighter than impulse', 1.5
+        elif pullback_volume_ratio >= 1.4:
+            pullback_read, pullback_points = 'countertrend volume stronger than impulse', 0.0
+        else:
+            pullback_read, pullback_points = 'countertrend volume near impulse volume', 0.75
 
-        score = 0.0
-        aligned_delta = delta_pct if direction == 'BUY' else -delta_pct
-        score += 3.0 if aligned_delta >= 20 else 2.0 if aligned_delta >= 8 else 1.0 if aligned_delta > 0 else 0.0
-        score += 2.0 if volume_share_pct >= 20 else 1.0 if volume_share_pct >= 8 else 0.0
         profile = analysis.get('profile') or {}
         poc, val, vah = profile.get('poc'), profile.get('val'), profile.get('vah')
         entry = float(zone.get('entry', (bottom + top) / 2.0))
         if poc is not None and bottom <= float(poc) <= top:
-            score += 3.0
-            profile_relation = 'zone contains POC'
+            profile_relation, profile_points = 'zone contains POC', 0.5
         elif val is not None and vah is not None and bottom <= float(vah) and top >= float(val):
-            score += 2.0
-            profile_relation = 'zone overlaps value area'
+            profile_relation, profile_points = 'zone overlaps value area', 0.25
         elif poc is not None and atr and abs(entry - float(poc)) <= 0.5 * atr:
-            score += 1.0
-            profile_relation = 'entry near POC'
+            profile_relation, profile_points = 'entry near POC', 0.125
         else:
-            profile_relation = 'zone outside value area'
-        details = {
-            'zone_delta_proxy_pct': round(delta_pct, 1),
+            profile_relation, profile_points = 'zone outside value area', 0.0
+
+        indicator_values = [
+            zone_delta_pct / 100.0,
+            zone_body_pct / 100.0,
+            float(analysis.get('obv_trend_pct', 0.0)) / 100.0,
+            float(analysis.get('cmf20_pct', 0.0)) / 100.0,
+            (float(analysis.get('mfi14', 50.0)) - 50.0) / 50.0,
+        ]
+        indicator_weights = [0.35, 0.15, 0.20, 0.15, 0.15]
+        pressure = sum(value * weight for value, weight in zip(indicator_values, indicator_weights))
+        aligned_pressure = pressure if direction == 'BUY' else -pressure
+        zone_pressure = 0.7 * (zone_delta_pct / 100.0) + 0.3 * (zone_body_pct / 100.0)
+        pressure_points = float(np.clip(1.25 + 1.25 * aligned_pressure, 0.0, 2.5))
+        participation_points = 1.0 if volume_share_pct >= 8 else 0.0
+        if volume_share_pct >= 20 and zone_rvol >= 1.0:
+            participation_points = 1.5
+        reaction_points = 2.0 if rejection_volume_pct >= 40 else 1.0 if rejection_volume_pct >= 20 else 0.0
+        score = min(8.0, pressure_points + participation_points + reaction_points + profile_points + pullback_points)
+        return {
+            'score': round(score, 1),
+            'zone_delta_proxy_pct': round(zone_delta_pct, 1),
+            'zone_body_pressure_pct': round(zone_body_pct, 1),
+            'zone_control': 'BUYERS' if zone_pressure >= 0.08 else 'SELLERS' if zone_pressure <= -0.08 else 'BALANCED',
             'zone_volume_share_pct': round(volume_share_pct, 1),
+            'zone_rvol': round(zone_rvol, 2),
+            'directional_rejection_volume_pct': round(rejection_volume_pct, 1),
+            'pullback_vs_impulse_volume_ratio': round(pullback_volume_ratio, 2) if pullback_volume_ratio is not None else None,
+            'pullback_volume_read': pullback_read,
+            'indicator_consensus': 'BUYERS' if pressure >= 0.08 else 'SELLERS' if pressure <= -0.08 else 'BALANCED',
+            'aligned_pressure': round(aligned_pressure, 3),
+            'obv_trend_pct': analysis.get('obv_trend_pct'),
+            'cmf20_pct': analysis.get('cmf20_pct'),
+            'mfi14': analysis.get('mfi14'),
+            'rvol': analysis.get('rvol'),
+            'bar_minutes': analysis.get('bar_minutes'),
             'profile_relation': profile_relation,
+            'poc': profile.get('poc'), 'val': profile.get('val'), 'vah': profile.get('vah'),
         }
-        return min(8.0, score), f"{profile_relation}; zone pressure proxy {delta_pct:+.1f}%; volume share {volume_share_pct:.1f}%", details
     except Exception:
-        return 4.0, 'volume calculation unavailable; neutral score', {}
+        return None
+
+def score_multi_timeframe_volume_zone(volume_frames, zone, direction, atr):
+    """Compare zone evidence across M10/M15/M30/H1/H4; missing feeds are excluded, not guessed."""
+    timeframe_weights = {'M10': 0.75, 'M15': 1.0, 'M30': 1.25, 'H1': 1.5, 'H4': 1.5}
+    observations = {}
+    duration_counts = {}
+    for label, snap in volume_frames.items():
+        observation = score_volume_zone(snap, zone, direction, atr)
+        if observation is not None:
+            observations[label] = observation
+            duration = observation.get('bar_minutes')
+            if duration:
+                duration_counts[duration] = duration_counts.get(duration, 0) + 1
+    if not observations:
+        return 4.0, 'volume unavailable; neutral score', {'timeframes': {}}
+    weighted = []
+    for label, observation in observations.items():
+        duration = observation.get('bar_minutes')
+        duplicate_adjustment = duration_counts.get(duration, 1) if duration else 1
+        weight = timeframe_weights.get(label, 1.0) / duplicate_adjustment
+        weighted.append((observation['score'], weight))
+    total_weight = sum(weight for _, weight in weighted)
+    score = sum(value * weight for value, weight in weighted) / total_weight
+    pressure_by_interval = {}
+    for label, item in observations.items():
+        interval = item.get('bar_minutes') or label
+        pressure_by_interval.setdefault(interval, []).append(item['aligned_pressure'])
+    pressure_values = [float(np.mean(values)) for values in pressure_by_interval.values()]
+    aligned_count = sum(value > 0.08 for value in pressure_values)
+    opposing_count = sum(value < -0.08 for value in pressure_values)
+    pullback_by_interval = {}
+    for label, item in observations.items():
+        interval = item.get('bar_minutes') or label
+        pullback_by_interval.setdefault(interval, []).append(item)
+    orderly_pullbacks = 0
+    heavy_countertrend = 0
+    for interval_items in pullback_by_interval.values():
+        interval_pressure = float(np.mean([item['aligned_pressure'] for item in interval_items]))
+        ratios = [item['pullback_vs_impulse_volume_ratio'] for item in interval_items
+                  if item.get('pullback_vs_impulse_volume_ratio') is not None]
+        interval_ratio = float(np.mean(ratios)) if ratios else None
+        orderly_pullbacks += interval_ratio is not None and interval_ratio <= 0.8 and interval_pressure > 0.08
+        heavy_countertrend += interval_ratio is not None and interval_ratio >= 1.4 and interval_pressure < -0.08
+    if orderly_pullbacks >= 2 and aligned_count >= opposing_count:
+        retest_assessment = 'Potential orderly retracement: countertrend volume is lighter in multiple frames; wait for confirmation at the structural zone.'
+    elif heavy_countertrend:
+        retest_assessment = 'Countertrend volume is elevated in one or more frames; the structural retest is not volume-confirmed.'
+    else:
+        retest_assessment = 'Volume does not clearly confirm a reload; use the structural zone and wait for price-action confirmation.'
+    details = {
+        'score': round(score, 1),
+        'timeframes': observations,
+        'retest_levels': {'zone_bottom': float(zone['bottom']), 'zone_top': float(zone['top']), 'limit_entry': float(zone.get('entry', (zone['bottom'] + zone['top']) / 2.0))},
+        'retest_assessment': retest_assessment,
+        'aligned_timeframes': aligned_count,
+        'opposing_timeframes': opposing_count,
+        'unique_source_intervals': len(pressure_by_interval),
+        'available_timeframes': list(observations),
+    }
+    summary = f"{aligned_count}/{len(pressure_by_interval)} source intervals aligned; {opposing_count} opposing; {retest_assessment}"
+    return score, summary, details
 
 def ema_trend(d, atr):
     try:
@@ -2016,8 +2150,9 @@ def score_plan(direction, plan, zone, bias, snaps, dxy_rel, regime, ltf_snaps, p
     b['Premium/discount location'] = 12.0 if depth <= 0.35 else 9.0 if depth <= 0.5 else 5.0 if depth <= 0.62 else 2.0
     volume_zone = dict(zone)
     volume_zone['entry'] = plan['entry']
-    volume_score, volume_detail, volume_metrics = score_volume_zone(snaps.get('H1'), volume_zone, direction, atr_h1)
-    b['Volume profile & pressure proxy'] = round(volume_score, 1)
+    volume_frames = snaps.get('_volume_frames') or {'H1': snaps.get('H1')}
+    volume_score, volume_detail, volume_metrics = score_multi_timeframe_volume_zone(volume_frames, volume_zone, direction, atr_h1)
+    b['Multi-timeframe zone volume & flow'] = round(volume_score, 1)
     volume_evidence = {'score': round(volume_score, 1), 'detail': volume_detail, **volume_metrics}
     ltf = 0.0
     candle_notes = []
@@ -2082,6 +2217,11 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
         row = {'kind': z['kind'], 'tf': z['tf'], 'bottom': z['bottom'], 'top': z['top'], 'entry': round_price(entry, cfg),
                'zone_score': z['zone_score'], 'dist_atr': z['dist_atr'], 'touches': z['touches'], 'confluence': z['confluence'],
                'valid': plan is not None, 'reason': reason}
+        volume_zone = dict(z)
+        volume_zone['entry'] = entry
+        _, _, row['volume_confirmation'] = score_multi_timeframe_volume_zone(
+            snaps.get('_volume_frames') or {'H1': snaps.get('H1')}, volume_zone, direction, atr_h1)
+        row['volume_score'] = row['volume_confirmation'].get('score', 4.0)
         if plan is not None:
             score, breakdown, candle_notes, volume_evidence = score_plan(direction, plan, z, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
             plan['zone'] = {'kind': z['kind'], 'tf': z['tf'], 'top': z['top'], 'bottom': z['bottom'],
@@ -2312,12 +2452,29 @@ def build_plan_reasoning(symbol, plan, bias, cfg, live_price):
 def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy, dxy_rel, levels):
     cand_lines = []
     for n, row in enumerate(audit[:5], 1):
+        volume_evidence = row.get('volume_confirmation') or {}
         cand_lines.append(f"{n}. {row['kind']} {_fmt(row['bottom'], cfg)}-{_fmt(row['top'], cfg)} -> entry {_fmt(row['entry'], cfg)}, zone score {row['zone_score']}, "
-                          f"{row['dist_atr']} ATR away, {'VALID' if row['valid'] else 'rejected: ' + row['reason']}")
+                          f"{row['dist_atr']} ATR away, volume {row.get('volume_score', 'n/a')}/8, "
+                          f"{volume_evidence.get('aligned_timeframes', 0)} aligned/{volume_evidence.get('opposing_timeframes', 0)} opposing source intervals, "
+                          f"{'VALID' if row['valid'] else 'rejected: ' + row['reason']}")
     lv = ', '.join(f"{k} {_fmt(v, cfg)}" for k, v in levels.items()) or 'n/a'
     m10 = snaps.get('_micro_m10') or {}
-    h1_volume = ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {}
-    h1_profile = h1_volume.get('profile') or {}
+    volume_frames = snaps.get('_volume_frames') or {}
+    volume_lines = []
+    for label in ('M10', 'M15', 'M30', 'H1', 'H4'):
+        frame = volume_frames.get(label) or {}
+        micro = frame.get('micro') or {}
+        metrics = micro.get('volume_analysis') or {}
+        if not metrics.get('available'):
+            volume_lines.append(f"{label}: unavailable")
+            continue
+        profile = metrics.get('profile') or {}
+        volume_lines.append(
+            f"{label} ({metrics.get('bar_minutes', '?')}m bars): global pressure {metrics.get('net_volume_proxy_side')} {metrics.get('net_volume_proxy_pct')}%, "
+            f"body pressure {metrics.get('body_pressure_pct')}%, OBV trend {metrics.get('obv_trend_pct')}%, CMF20 {metrics.get('cmf20_pct')}%, "
+            f"MFI14 {metrics.get('mfi14')}, delta trend {metrics.get('delta_trend_pct')}%, RVOL {metrics.get('rvol')}, "
+            f"VWAP {micro.get('price_vs_vwap', 'n/a')}, POC/VAL/VAH {profile.get('poc')}/{profile.get('val')}/{profile.get('vah')}"
+        )
     m10_candles = snaps.get('_candles_m10') or []
     m10_pattern = m10_candles[-1]['pattern'] if m10_candles else 'n/a'
     body = f"""You are the risk auditor of an institutional trading desk. A deterministic Python engine has ALREADY decided direction and exact levels using strict top-down analysis (H4/H1 decide direction; M30/M15 only refine the limit price inside the HTF zone). You may NOT change direction, entry, stop or target. Your job is to sanity-check the plan, use the chart screenshot if one is attached, flag concrete risks, and write a concise rationale.
@@ -2333,8 +2490,9 @@ H1: {describe_snapshot(snaps.get('H1'), cfg)}
 M30: {describe_snapshot(snaps.get('M30'), cfg)}
 M15: {describe_snapshot(snaps.get('M15'), cfg)}
 M10 MICRO: VWAP {m10.get('vwap', 'n/a')} | price vs VWAP {m10.get('price_vs_vwap', 'n/a')} | RVOL {m10.get('rvol', 'n/a')} | momentum {m10.get('momentum', 'n/a')} | last candle {m10_pattern}
-H1 VOLUME: {h1_volume.get('net_volume_proxy_side', 'UNAVAILABLE')} pressure proxy {h1_volume.get('net_volume_proxy_pct', 'n/a')}% over the last 20 closed bars | RVOL {h1_volume.get('rvol', 'n/a')} | volume profile POC {h1_profile.get('poc', 'n/a')}, VAL {h1_profile.get('val', 'n/a')}, VAH {h1_profile.get('vah', 'n/a')} ({h1_profile.get('lookback_bars', 0)} bars)
-VOLUME DATA LIMIT: Volume pressure and volume-at-price are estimates derived from OHLCV candles, not exchange bid/ask delta or a true traded volume profile. Do not describe the proxy as confirmed buyer/seller order flow; unavailable volume is not bearish or bullish.
+MULTI-TIMEFRAME VOLUME INDICATORS:
+{chr(10).join(volume_lines)}
+VOLUME DATA LIMIT: Candle-based pressure, OBV, MFI, and volume-at-price are OHLCV estimates, not exchange bid/ask delta. Interpret timeframe disagreement and missing/duplicated fallback intervals explicitly; do not claim verified aggressor-side flow.
 KEY LEVELS: {lv}
 DXY: {dxy.get('detail')} -> relation to this trade: {dxy_rel}
 RANKED HTF ENTRY CANDIDATES:
@@ -2424,6 +2582,17 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         risk_flags = [str(x) for x in (ai.get('risk_flags') or []) if x][:3]
     py_reason = build_plan_reasoning(symbol, plan, bias, cfg, live_price)
     reasoning = py_reason + (f" Auditor: {ai_text}" if ai_text else '')
+    volume_frames = snaps.get('_volume_frames') or {}
+    zone_volume_by_tf = (plan.get('volume_confirmation') or {}).get('timeframes') or {}
+    volume_analysis_by_tf = {}
+    for label, frame in volume_frames.items():
+        micro = frame.get('micro') or {}
+        metrics = micro.get('volume_analysis') or {}
+        if metrics.get('available'):
+            volume_analysis_by_tf[label] = {
+                **metrics, 'vwap': micro.get('vwap'), 'price_vs_vwap': micro.get('price_vs_vwap'),
+                'zone': zone_volume_by_tf.get(label, {})
+            }
     result = {
         'symbol': symbol, 'signal': plan['direction'], 'bias': bias['word'],
         'confluence_score': score, 'confidence': confidence_for(score), 'grade': grade_for(score),
@@ -2441,6 +2610,7 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         'regime': (regime or {}).get('regime'), 'atr': atr_h1, 'live_price': live_price,
         'dxy_summary': dxy.get('detail'), 'ai_used': ai_used,
         'volume_analysis': ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {},
+        'volume_analysis_by_tf': volume_analysis_by_tf,
         'volume_confirmation': plan.get('volume_confirmation') or {},
         'microstructure_read': (ai.get('microstructure_read') if ai_used and ai.get('microstructure_read') else
                                 'VWAP {} | RVOL {} | momentum {} | last candle {}'.format(
@@ -2492,8 +2662,20 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             'M30': analyze_structure(data.get('M30'), 'M30', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
             'M15': analyze_structure(data.get('M15'), 'M15', left=3, right=3, leg_atr=0.8, ob_disp_atr=cfg['ob_disp_atr'], fvg_min_atr=cfg['fvg_min_atr'], liq_tol_atr=cfg['liq_tol_atr']),
         }
-        snaps['_micro_m10'] = calculate_microstructure(m10)
-        snaps['_candles_m10'] = classify_candles(closed_candles(m10))
+        m10_closed = closed_candles(m10)
+        snaps['_micro_m10'] = calculate_microstructure(m10_closed)
+        snaps['_candles_m10'] = classify_candles(m10_closed)
+        volume_frames = {'M10': {'df': m10_closed, 'micro': snaps['_micro_m10']}}
+        for label, raw_frame in (('M15', data.get('M15')), ('M30', data.get('M30')), ('H1', h1_raw), ('H4', h4_raw)):
+            if raw_frame is None or raw_frame.empty:
+                continue
+            structural_snap = snaps.get(label)
+            closed_frame = structural_snap['df'] if structural_snap else closed_candles(raw_frame)
+            volume_frames[label] = {
+                'df': closed_frame,
+                'micro': (structural_snap or {}).get('micro') or calculate_microstructure(closed_frame),
+            }
+        snaps['_volume_frames'] = volume_frames
         if not snaps['H1']:
             return {"error": f"Not enough closed H1 history for {symbol} to build a reliable higher-timeframe structure. Try again shortly."}
         atr_h1 = snaps['H1']['atr']
@@ -2552,6 +2734,24 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             result['htf_bias'] = bias
             result['analyzed_at_live'] = utc_now().isoformat()
             result['gap_to_entry'] = round(abs(current_price - float(live_existing['entry'])), cfg['digits'])
+            locked_zone = result.get('zone') or live_existing.get('zone') or {}
+            if locked_zone.get('bottom') is not None and locked_zone.get('top') is not None:
+                volume_zone = dict(locked_zone)
+                volume_zone['entry'] = float(live_existing['entry'])
+                _, _, result['volume_confirmation'] = score_multi_timeframe_volume_zone(
+                    snaps.get('_volume_frames') or {}, volume_zone, live_existing['direction'], atr_h1)
+                result['volume_analysis_by_tf'] = {}
+                for timeframe, frame in (snaps.get('_volume_frames') or {}).items():
+                    micro = frame.get('micro') or {}
+                    metrics = micro.get('volume_analysis') or {}
+                    if metrics.get('available'):
+                        zone_metrics = (result['volume_confirmation'].get('timeframes') or {}).get(timeframe, {})
+                        result['volume_analysis_by_tf'][timeframe] = {
+                            **metrics, 'vwap': micro.get('vwap'),
+                            'price_vs_vwap': micro.get('price_vs_vwap'), 'zone': zone_metrics
+                        }
+                result['volume_analysis'] = ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {}
+                result['volume_context_is_advisory'] = True
             if label == 'OPEN_TRADE_CONFLICT':
                 result.setdefault('python_validation_notes', [])
                 msg = f"HTF bias is now {direction} but the {live_existing['direction']} trade is already FILLED and open — manage it (SL/TP unchanged). A new plan will be built after it closes."
@@ -2747,15 +2947,40 @@ def render_signal_card(symbol, result, all_data):
     st.write(f"**Stop anchor:** {result.get('sl_anchor')} · **TP1:** {result.get('tp1_kind')} · **TP2:** {result.get('tp2_kind')}")
     st.write(f"**DXY correlation:** {result.get('dxy_correlation', 'N/A')} · **Regime (H1):** {result.get('regime', 'n/a')} · **Microstructure:** {result.get('microstructure_read', 'N/A')}")
     with st.expander('📊 Volume profile & pressure evidence'):
-        volume = result.get('volume_analysis') or {}
-        profile = volume.get('profile') or {}
-        if volume.get('available'):
-            st.write(f"**H1 pressure proxy:** {volume.get('net_volume_proxy_side')} {volume.get('net_volume_proxy_pct'):+.1f}% · **RVOL:** {volume.get('rvol', 'n/a')}")
-            st.write(f"**Volume profile:** POC {_fmt(profile.get('poc'), cfg)} · VAL {_fmt(profile.get('val'), cfg)} · VAH {_fmt(profile.get('vah'), cfg)} · {profile.get('lookback_bars', 0)} closed bars")
-            confirmation = result.get('volume_confirmation') or {}
-            if confirmation:
-                st.write(f"**Selected-zone evidence:** {confirmation.get('detail', 'n/a')} · score {confirmation.get('score', 0)}/8")
-            st.caption('Profile assigns each candle volume to its typical price; pressure estimates candle-level buying/selling from close location. Neither is true bid/ask order flow.')
+        volume_by_tf = result.get('volume_analysis_by_tf') or {}
+        confirmation = result.get('volume_confirmation') or {}
+        if volume_by_tf:
+            if result.get('volume_context_is_advisory'):
+                st.caption('Volume context refreshed from current candles; the locked plan levels and original score are unchanged.')
+            retest_levels = confirmation.get('retest_levels') or {}
+            st.write(f"**Potential retracement:** {_fmt(retest_levels.get('zone_bottom'), cfg)}–{_fmt(retest_levels.get('zone_top'), cfg)} · planned LIMIT {_fmt(retest_levels.get('limit_entry'), cfg)}")
+            st.write(f"**Reload assessment:** {confirmation.get('retest_assessment', 'n/a')} · score {confirmation.get('score', 0)}/8")
+            volume_rows = []
+            for timeframe in ('M10', 'M15', 'M30', 'H1', 'H4'):
+                metrics = volume_by_tf.get(timeframe)
+                if not metrics:
+                    continue
+                zone_metrics = metrics.get('zone') or {}
+                profile = metrics.get('profile') or {}
+                volume_rows.append({
+                    'TF': timeframe, 'Bar min': metrics.get('bar_minutes'),
+                    'TF pressure': metrics.get('net_volume_proxy_side'),
+                    'TF delta %': metrics.get('net_volume_proxy_pct'),
+                    'Zone control': zone_metrics.get('zone_control', 'n/a'),
+                    'Zone delta %': zone_metrics.get('zone_delta_proxy_pct'),
+                    'Reject vol %': zone_metrics.get('directional_rejection_volume_pct'),
+                    'Zone RVOL': zone_metrics.get('zone_rvol'),
+                    'Pullback/impulse vol': zone_metrics.get('pullback_vs_impulse_volume_ratio'),
+                    'Pullback read': zone_metrics.get('pullback_volume_read', 'n/a'),
+                    'VWAP': metrics.get('price_vs_vwap', 'n/a'),
+                    'Indicator consensus': zone_metrics.get('indicator_consensus', 'n/a'),
+                    'OBV %': metrics.get('obv_trend_pct'), 'CMF %': metrics.get('cmf20_pct'),
+                    'MFI': metrics.get('mfi14'), 'RVOL': metrics.get('rvol'),
+                    'POC': _fmt(zone_metrics.get('poc', profile.get('poc')), cfg),
+                    'Value area': zone_metrics.get('profile_relation', 'n/a'),
+                })
+            st.dataframe(pd.DataFrame(volume_rows), hide_index=True, use_container_width=True)
+            st.caption('Zone control combines candle-pressure, body-volume, OBV, CMF and MFI proxies. Pullback/impulse volume below 1 suggests weaker countertrend candle volume; above 1 suggests stronger countertrend participation. Rejection measures volume on candles closing beyond the zone in the intended direction. These are OHLCV estimates, not bid/ask trade delta.')
         else:
             st.info('Usable volume data is unavailable for this feed; volume was treated as neutral in candidate scoring.')
     if result.get('order_description'):
@@ -2782,7 +3007,9 @@ def render_signal_card(symbol, result, all_data):
             st.dataframe(pd.DataFrame([{
                 'Zone': r.get('kind'), 'Range': f"{_fmt(r.get('bottom'), cfg)}–{_fmt(r.get('top'), cfg)}", 'Limit entry': _fmt(r.get('entry'), cfg),
                 'Zone score': r.get('zone_score'), 'ATR away': r.get('dist_atr'), 'Tested': r.get('touches'),
-                'Plan score': r.get('score', '—'), 'Result': 'chosen/valid' if r.get('valid') else r.get('reason'),
+                'Plan score': r.get('score', '—'), 'Volume score': r.get('volume_score'),
+                'TF flow aligned/opposed': f"{(r.get('volume_confirmation') or {}).get('aligned_timeframes', 0)}/{(r.get('volume_confirmation') or {}).get('opposing_timeframes', 0)}",
+                'Result': 'chosen/valid' if r.get('valid') else r.get('reason'),
             } for r in rows]), hide_index=True, use_container_width=True)
         else:
             st.caption('No HTF zone was in reach on the correct side of price.')
