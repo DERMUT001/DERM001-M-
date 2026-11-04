@@ -73,10 +73,6 @@ TELEGRAM_CHAT_ID = get_secret("TELEGRAM_CHAT_ID", "")
 SYMBOLS = ['XAUUSD', 'EURUSD', 'BTCUSD', 'US30']
 YFINANCE_MAP = {'XAUUSD': 'GC=F', 'EURUSD': 'EURUSD=X', 'BTCUSD': 'BTC-USD', 'US30': '^DJI', 'DXY': 'DX-Y.NYB'}
 BITFINEX_SYMBOLS = {'BTCUSD': 'tBTCUSD', 'XAUUSD': 'tXAUT:USD', 'EURUSD': 'tEURUSD', 'DXY': None}
-OANDA_SYMBOLS = {'XAUUSD': 'XAU_USD'}
-OANDA_API_TOKEN = str(get_secret('OANDA_API_TOKEN', '')).strip()
-OANDA_ACCOUNT_ID = str(get_secret('OANDA_ACCOUNT_ID', '')).strip()
-OANDA_ENVIRONMENT = str(get_secret('OANDA_ENVIRONMENT', 'practice')).strip().lower()
 MINIMUM_CONFLUENCE_SCORE = 82
 MINIMUM_ALIGNED_VOLUME_INTERVALS = 2
 GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -208,8 +204,6 @@ def _build_dataframe_from_records(records):
 
 def _market_instrument_label(symbol, provider):
     if symbol == 'XAUUSD':
-        if provider == 'oanda':
-            return 'OANDA:XAUUSD (OANDA v20 midpoint)'
         return 'Bitfinex XAUT/USD (gold-backed token)' if provider == 'bitfinex' else 'Yahoo Finance GC=F (COMEX gold futures)'
     if provider == 'bitfinex':
         return f"Bitfinex {BITFINEX_SYMBOLS.get(symbol, symbol)}"
@@ -221,63 +215,54 @@ def _tag_market_data(df, symbol, provider):
         df.attrs['market_data_instrument'] = _market_instrument_label(symbol, provider)
     return df
 
-def _oanda_is_configured():
-    return bool(OANDA_API_TOKEN and OANDA_ACCOUNT_ID and OANDA_ENVIRONMENT in ('live', 'practice'))
-
-def _oanda_api_base_url():
-    if OANDA_ENVIRONMENT == 'live':
-        return 'https://api-fxtrade.oanda.com'
-    if OANDA_ENVIRONMENT == 'practice':
-        return 'https://api-fxpractice.oanda.com'
-    raise ValueError("OANDA_ENVIRONMENT must be 'live' or 'practice'")
-
-def _oanda_headers():
-    return {
-        'Authorization': f'Bearer {OANDA_API_TOKEN}',
-        'Accept-Datetime-Format': 'RFC3339',
-    }
-
-def fetch_candles_from_oanda(symbol, interval):
-    instrument = OANDA_SYMBOLS.get(symbol)
-    if not instrument or not OANDA_API_TOKEN:
-        return pd.DataFrame()
-    granularity = {
-        '5m': 'M5', '15m': 'M15', '30m': 'M30',
-        '60m': 'H1', '1h': 'H1', '4h': 'H4', '1d': 'D',
-    }.get(interval)
-    if not granularity:
-        return pd.DataFrame()
-    count = {
-        '5m': 1440, '15m': 480, '30m': 240,
-        '60m': 720, '1h': 720, '4h': 540, '1d': 365,
-    }[interval]
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_yahoo_chart_quote(yf_symbol):
     try:
         response = requests.get(
-            f'{_oanda_api_base_url()}/v3/instruments/{instrument}/candles',
-            params={'granularity': granularity, 'count': count, 'price': 'M'},
-            headers=_oanda_headers(),
-            timeout=20,
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}',
+            params={'range': '1d', 'interval': '1m', 'includePrePost': 'true'},
+            timeout=10,
+            headers={'User-Agent': 'Mozilla/5.0'},
         )
         response.raise_for_status()
-        candles = response.json().get('candles')
-        if not isinstance(candles, list):
-            raise ValueError('Unexpected OANDA candle response')
-        records = []
-        for candle in candles:
-            mid = candle.get('mid') or {}
-            if not isinstance(mid, dict) or not candle.get('time'):
+        chart = response.json().get('chart', {})
+        result = (chart.get('result') or [{}])[0]
+        meta = result.get('meta') or {}
+        candidates = []
+        for price_key, time_key in (
+            ('regularMarketPrice', 'regularMarketTime'),
+            ('postMarketPrice', 'postMarketTime'),
+            ('preMarketPrice', 'preMarketTime'),
+        ):
+            if meta.get(time_key) is not None:
+                candidates.append((meta.get(time_key), meta.get(price_key), price_key))
+        timestamps = result.get('timestamp') or []
+        quote_data = ((result.get('indicators') or {}).get('quote') or [{}])[0]
+        closes = quote_data.get('close') or []
+        candidates.extend(
+            (timestamp, close, 'latest chart candle')
+            for timestamp, close in zip(timestamps, closes) if close is not None
+        )
+        candidates.sort(key=lambda item: float(item[0]), reverse=True)
+        for timestamp, candidate, price_source in candidates:
+            try:
+                price = float(candidate)
+                quote_timestamp = datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
                 continue
-            records.append({
-                'datetime': candle['time'],
-                'Open': mid.get('o'), 'High': mid.get('h'),
-                'Low': mid.get('l'), 'Close': mid.get('c'),
-                # OANDA's candle volume counts price updates, not executed trade volume.
-                'Volume': 0.0,
-            })
-        return _tag_market_data(_build_dataframe_from_records(records), symbol, 'oanda')
+            if price <= 0:
+                continue
+            quote_age = max(0, int((utc_now() - quote_timestamp).total_seconds()))
+            return {
+                'price': price,
+                'source': f"yahoo_{price_source.replace(' ', '_').lower()}",
+                'quote_time': quote_timestamp.isoformat(),
+                'quote_age_seconds': quote_age,
+                'is_live_quote': quote_age <= 300,
+            }
     except Exception as exc:
-        print(f"⚠️ OANDA candle fetch failed for {symbol} [{interval}]: {exc}")
-        return pd.DataFrame()
+        print(f"⚠️ Yahoo quote failed for {yf_symbol}: {exc}")
+    return None
 
 def fetch_candles_from_bitfinex(symbol, interval, limit=None):
     bitfinex_symbol = BITFINEX_SYMBOLS.get(symbol)
@@ -313,18 +298,6 @@ def fetch_candles_from_bitfinex(symbol, interval, limit=None):
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_ohlcv(yf_symbol, interval, period, preferred_provider=None):
     if yf is None:
-        return pd.DataFrame()
-    market_symbol = next((
-        symbol for symbol in ['BTCUSD', 'XAUUSD', 'EURUSD', 'DXY']
-        if yf_symbol in {symbol, YFINANCE_MAP.get(symbol, symbol)}
-    ), None)
-    if market_symbol == 'XAUUSD' and preferred_provider in (None, 'oanda') and _oanda_is_configured():
-        oanda_df = fetch_candles_from_oanda(market_symbol, interval)
-        if not oanda_df.empty:
-            return oanda_df
-        if preferred_provider == 'oanda':
-            return pd.DataFrame()
-    if preferred_provider == 'oanda':
         return pd.DataFrame()
     for symbol in ['BTCUSD', 'XAUUSD', 'EURUSD', 'DXY']:
         if yf_symbol in {symbol, YFINANCE_MAP.get(symbol, symbol)}:
@@ -508,11 +481,8 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
 
     provider = (fallback_df.attrs.get('market_data_provider')
                 if fallback_df is not None and not fallback_df.empty else None)
-    if provider not in ('oanda', 'bitfinex', 'yahoo'):
-        if symbol == 'XAUUSD' and _oanda_is_configured():
-            provider = 'oanda'
-        else:
-            provider = 'bitfinex' if BITFINEX_SYMBOLS.get(symbol) else 'yahoo'
+    if provider not in ('bitfinex', 'yahoo'):
+        provider = 'bitfinex' if BITFINEX_SYMBOLS.get(symbol) else 'yahoo'
     instrument = _market_instrument_label(symbol, provider)
     fetched_at = utc_now()
     fallback_snapshot = {
@@ -540,49 +510,6 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
             ) if snapshot.get('price') and fallback_price else None
         return snapshot
 
-    if provider == 'oanda' and OANDA_SYMBOLS.get(symbol) and _oanda_is_configured():
-        try:
-            response = requests.get(
-                f'{_oanda_api_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing',
-                params={'instruments': OANDA_SYMBOLS[symbol]},
-                headers=_oanda_headers(),
-                timeout=10,
-            )
-            response.raise_for_status()
-            prices = response.json().get('prices') or []
-            price_data = next(
-                (item for item in prices if item.get('instrument') == OANDA_SYMBOLS[symbol]),
-                None,
-            )
-            if not price_data or price_data.get('status') != 'tradeable':
-                raise ValueError(f"No tradeable OANDA price for {OANDA_SYMBOLS[symbol]}")
-            bids, asks = price_data.get('bids') or [], price_data.get('asks') or []
-            bid = float(bids[0]['price'])
-            ask = float(asks[0]['price'])
-            if bid <= 0 or ask < bid:
-                raise ValueError('Invalid OANDA bid/ask quote')
-            quote_timestamp = pd.Timestamp(price_data['time']).to_pydatetime()
-            if quote_timestamp.tzinfo is None:
-                quote_timestamp = quote_timestamp.replace(tzinfo=timezone.utc)
-            quote_age = max(0, int((utc_now() - quote_timestamp).total_seconds()))
-            return finish_snapshot({
-                'symbol': symbol,
-                'price': (bid + ask) / 2,
-                'source': 'oanda_midpoint_quote',
-                'provider': 'oanda',
-                'instrument': instrument,
-                'bid': bid,
-                'ask': ask,
-                'quote_time': quote_timestamp.isoformat(),
-                'quote_time_kind': 'provider timestamp',
-                'fetched_at': utc_now().isoformat(),
-                'quote_age_seconds': quote_age,
-                'is_live_quote': quote_age <= 300,
-            })
-        except Exception as exc:
-            print(f"⚠️ OANDA live quote failed for {symbol}: {exc}")
-        return fallback_snapshot
-
     bitfinex_symbol = BITFINEX_SYMBOLS.get(symbol)
     if provider == 'bitfinex' and bitfinex_symbol:
         try:
@@ -597,7 +524,7 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
             price = float(payload[6])
             if price > 0:
                 fetched_at = utc_now()
-                return finish_snapshot({
+                snapshot = finish_snapshot({
                     'symbol': symbol,
                     'price': price,
                     'source': 'bitfinex_last_trade',
@@ -613,60 +540,33 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
                     'quote_age_seconds': None,
                     'is_live_quote': True,
                 })
+                if symbol == 'XAUUSD':
+                    reference = _fetch_yahoo_chart_quote(yf_symbol)
+                    if reference:
+                        snapshot['reference_quote'] = {
+                            **reference,
+                            'instrument': _market_instrument_label(symbol, 'yahoo'),
+                        }
+                        snapshot['reference_difference_pct'] = round(
+                            (price - reference['price']) / reference['price'] * 100.0,
+                            4,
+                        )
+                return snapshot
         except Exception as exc:
             print(f"⚠️ Bitfinex ticker failed for {symbol}: {exc}")
         return fallback_snapshot
 
     if provider == 'yahoo':
-        try:
-            response = requests.get(
-                f'https://query1.finance.yahoo.com/v8/finance/chart/{yf_symbol}',
-                params={'range': '1d', 'interval': '1m', 'includePrePost': 'true'},
-                timeout=10,
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
-            response.raise_for_status()
-            chart = response.json().get('chart', {})
-            result = (chart.get('result') or [{}])[0]
-            meta = result.get('meta') or {}
-            candidates = []
-            for price_key, time_key in (
-                ('regularMarketPrice', 'regularMarketTime'),
-                ('postMarketPrice', 'postMarketTime'),
-                ('preMarketPrice', 'preMarketTime'),
-            ):
-                if meta.get(time_key) is not None:
-                    candidates.append((meta.get(time_key), meta.get(price_key), price_key))
-            timestamps = result.get('timestamp') or []
-            quote_data = ((result.get('indicators') or {}).get('quote') or [{}])[0]
-            closes = quote_data.get('close') or []
-            for timestamp, candidate in zip(timestamps, closes):
-                if candidate is not None:
-                    candidates.append((timestamp, candidate, 'latest chart candle'))
-            candidates.sort(key=lambda item: float(item[0]), reverse=True)
-            for timestamp, candidate, price_source in candidates:
-                try:
-                    price = float(candidate)
-                    quote_timestamp = datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-                except (TypeError, ValueError, OSError):
-                    continue
-                if price <= 0:
-                    continue
-                quote_age = max(0, int((utc_now() - quote_timestamp).total_seconds()))
-                return finish_snapshot({
-                    'symbol': symbol,
-                    'price': price,
-                    'source': f"yahoo_{price_source.replace(' ', '_').lower()}",
-                    'provider': 'yahoo',
-                    'instrument': instrument,
-                    'quote_time': quote_timestamp.isoformat(),
-                    'quote_time_kind': 'provider timestamp',
-                    'fetched_at': utc_now().isoformat(),
-                    'quote_age_seconds': quote_age,
-                    'is_live_quote': quote_age <= 300,
-                })
-        except Exception as exc:
-            print(f"⚠️ Yahoo quote failed for {symbol}: {exc}")
+        quote = _fetch_yahoo_chart_quote(yf_symbol)
+        if quote:
+            return finish_snapshot({
+                'symbol': symbol,
+                **quote,
+                'provider': 'yahoo',
+                'instrument': instrument,
+                'quote_time_kind': 'provider timestamp',
+                'fetched_at': utc_now().isoformat(),
+            })
     return finish_snapshot(fallback_snapshot)
 
 def refresh_symbol_data_if_stale(symbol, yf_symbol, market_snapshot, data):
@@ -2875,8 +2775,14 @@ def build_telegram_signal_message(symbol, result):
         )
     if zone:
         lines.append(f"📍 Zone: {_escape_telegram_html(zone.get('kind'))} {_fmt(zone.get('bottom'), cfg)}-{_fmt(zone.get('top'), cfg)}")
-    if market_data.get('provider') != 'oanda' and symbol == 'XAUUSD':
-        lines.append('⚠️ Price feed is a proxy, not the selected TradingView OANDA:XAUUSD feed.')
+    if symbol == 'XAUUSD':
+        lines.append('⚠️ Public gold proxy feed; may differ from your broker spot/CFD quote.')
+        reference = market_data.get('reference_quote') or {}
+        if reference.get('price') is not None:
+            lines.append(
+                f"🔎 Yahoo GC=F futures reference: {_fmt(reference['price'], cfg)} "
+                f"(primary/reference {market_data.get('reference_difference_pct', 'n/a')}%)"
+            )
     lines.append(f"🤖 Model: {_escape_telegram_html(result.get('model_used', 'Unknown'))} | 📈 Score: {result.get('confluence_score', 0)}/100 | 🔋 Tokens: {result.get('total_tokens', 'N/A')}")
     lines.append(f"🧾 Order: {_escape_telegram_html(result.get('order_type', 'LIMIT'))}")
     tp_txt = f"🎯 TP1: {tp1}" + (f" | TP2: {tp2}" if tp2 else '')
@@ -3331,18 +3237,21 @@ def render_market_data_provenance(result, cfg):
         difference = market_data.get('candle_price_difference_pct')
         if difference is not None:
             details.append(f"quote vs M10 close {difference:+.4f}%")
+    reference = market_data.get('reference_quote')
+    if reference:
+        reference_time = str(reference.get('quote_time') or '')
+        details.append(
+            f"independent {reference.get('instrument')} reference {_fmt(reference.get('price'), cfg)}"
+            + (f" at {reference_time[:19].replace('T', ' ')} UTC" if reference_time else '')
+            + f"; primary/reference difference {market_data.get('reference_difference_pct', 'n/a')}%"
+        )
     st.caption(' · '.join(details))
     if market_data.get('source') == 'candle_close_fallback':
         st.warning('Live quote unavailable; the displayed reference price is the latest candle close.')
     elif market_data.get('provider') == 'yahoo' and not market_data.get('is_live_quote'):
         st.warning('The latest Yahoo quote/candle is more than five minutes old; check your broker before execution.')
-    if market_data.get('provider') == 'oanda':
-        st.info("OANDA candle counts are price updates, not traded volume; volume-derived indicators are disabled for this feed.")
-    if result.get('symbol') == 'XAUUSD' and market_data.get('provider') != 'oanda':
-        st.warning(
-            'This is not the selected TradingView OANDA:XAUUSD feed. Configure OANDA_API_TOKEN, '
-            'OANDA_ACCOUNT_ID, and OANDA_ENVIRONMENT in Streamlit Secrets to use OANDA prices.'
-        )
+    if result.get('symbol') == 'XAUUSD':
+        st.info("XAUUSD uses public, keyless market feeds: Bitfinex XAUT/USD (gold-backed token) and a Yahoo GC=F COMEX-futures cross-check. These are different instruments from a broker's spot/CFD XAUUSD quote and can diverge.")
 
 def render_signal_card(symbol, result, all_data):
     cfg = get_pair_config(symbol)
@@ -3685,18 +3594,12 @@ with tab5:
     st.header("⚙️ System Settings")
     st.info("Ensure `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, and `TELEGRAM_CHAT_ID` are set in your Streamlit Secrets.")
     st.subheader("Market data source")
-    if _oanda_is_configured():
-        st.success(f"XAUUSD feed: OANDA v20 ({OANDA_ENVIRONMENT}) · candles and midpoint quotes.")
-    else:
-        st.warning("TradingView OANDA:XAUUSD matching is not active; XAUUSD uses a labeled public-feed fallback.")
-    st.code(
-        'OANDA_API_TOKEN = "your OANDA personal access token"\n'
-        'OANDA_ACCOUNT_ID = "your OANDA v20 account ID"\n'
-        'OANDA_ENVIRONMENT = "live"  # or "practice"',
-        language="toml",
+    st.success("XAUUSD price data uses public endpoints; no market-data API key or account ID is required.")
+    st.markdown(
+        "- **Primary:** [Bitfinex public XAUT/USD market](https://api-pub.bitfinex.com/v2/ticker/tXAUT:USD) — live tokenized-gold quote and venue-specific candles.\n"
+        "- **Cross-check/fallback:** [Yahoo Finance GC=F](https://finance.yahoo.com/quote/GC=F/) — COMEX gold futures, not spot XAUUSD."
     )
-    st.markdown("[OANDA API access and documentation](https://developer.oanda.com/rest-live-v20/introduction/)")
-    st.caption("The OANDA connection is read-only market data. It requests midpoint candles and bid/ask midpoint quotes; it does not place or manage orders. OANDA candle counts are price updates, not traded volume, so volume-derived indicators are disabled. The API feed may still differ slightly from TradingView's displayed quote.")
+    st.caption("These are keyless public feeds, but they are different instruments from TradingView OANDA:XAUUSD or a broker's spot/CFD quote. The app displays both the primary price and, when available, the Yahoo futures reference; neither guarantees an exact broker execution price.")
     st.markdown("**How a signal is decided now**")
     st.markdown(
         "1. **Direction = H4 + H1 only.** Confirmed pivots, HH/HL/LH/LL, close-based BOS/CHOCH, EMA trend and RSI regime. M10/M15/M30 have no vote.\n"
