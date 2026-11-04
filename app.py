@@ -598,17 +598,21 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
             spot_quote = _fetch_gold_api_xau_quote()
             reference = _fetch_yahoo_chart_quote(yf_symbol)
             if spot_quote:
-                freshness_age = max(
-                    spot_quote['quote_age_seconds'],
-                    latest_trade['quote_age_seconds'] if latest_trade else MAX_LIVE_QUOTE_AGE_SECONDS + 1,
+                live_basis_trade = latest_trade if latest_trade and latest_trade['is_live_quote'] else None
+                freshness_warning = (
+                    f"Gold-API XAU update is {spot_quote['quote_age_seconds']}s old."
+                    if not spot_quote['is_live_quote'] else None
                 )
-                freshness_warning = None
-                if not spot_quote['is_live_quote']:
-                    freshness_warning = f"Gold-API XAU update is {spot_quote['quote_age_seconds']}s old."
-                elif not latest_trade:
-                    freshness_warning = 'Bitfinex last-trade timestamp could not be verified.'
-                elif not latest_trade['is_live_quote']:
-                    freshness_warning = f"Bitfinex candle-basis trade is {latest_trade['quote_age_seconds']}s old."
+                basis_alignment_warning = None
+                if not live_basis_trade:
+                    trade_age = latest_trade.get('quote_age_seconds') if latest_trade else None
+                    basis_alignment_warning = (
+                        f"Bitfinex XAUT/USD last trade is {trade_age}s old; "
+                        "the fresh Gold-API quote is still verified, but candle history was not basis-adjusted."
+                        if trade_age is not None else
+                        "Bitfinex XAUT/USD last-trade time could not be verified; "
+                        "the fresh Gold-API quote is still verified, but candle history was not basis-adjusted."
+                    )
                 snapshot = finish_snapshot({
                     'symbol': symbol,
                     'price': spot_quote['price'],
@@ -618,42 +622,37 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
                     'bid': float(ticker[0]) if ticker and ticker[0] is not None else None,
                     'ask': float(ticker[2]) if ticker and ticker[2] is not None else None,
                     'daily_high': (
-                        float(ticker[8]) + (spot_quote['price'] - latest_trade['price'])
-                        if ticker and ticker[8] is not None and latest_trade else None
+                        float(ticker[8]) + (spot_quote['price'] - live_basis_trade['price'])
+                        if ticker and ticker[8] is not None and live_basis_trade else None
                     ),
                     'daily_low': (
-                        float(ticker[9]) + (spot_quote['price'] - latest_trade['price'])
-                        if ticker and ticker[9] is not None and latest_trade else None
+                        float(ticker[9]) + (spot_quote['price'] - live_basis_trade['price'])
+                        if ticker and ticker[9] is not None and live_basis_trade else None
                     ),
                     'venue_daily_high': float(ticker[8]) if ticker and ticker[8] is not None else None,
                     'venue_daily_low': float(ticker[9]) if ticker and ticker[9] is not None else None,
                     'daily_range_basis': (
                         'Bitfinex XAUT/USD range shifted by the current spot basis (estimate)'
-                        if ticker and latest_trade else None
+                        if ticker and live_basis_trade else None
                     ),
                     'quote_time': spot_quote['quote_time'],
                     'quote_time_kind': 'Gold-API updatedAt',
                     'fetched_at': utc_now().isoformat(),
                     'quote_age_seconds': spot_quote['quote_age_seconds'],
-                    'freshness_age_seconds': freshness_age,
-                    'is_live_quote': bool(
-                        spot_quote['is_live_quote']
-                        and latest_trade
-                        and latest_trade['is_live_quote']
-                    ),
+                    'freshness_age_seconds': spot_quote['quote_age_seconds'],
+                    'is_live_quote': spot_quote['is_live_quote'],
                     'venue_trade_quote': latest_trade,
                     'venue_trade_instrument': instrument,
                     'venue_price_difference_pct': (
                         round((spot_quote['price'] - latest_trade['price']) / latest_trade['price'] * 100.0, 4)
-                        if latest_trade and latest_trade['price'] else None
+                        if live_basis_trade and live_basis_trade['price'] else None
                     ),
                     'candle_basis_adjustment': (
-                        round(spot_quote['price'] - latest_trade['price'], 5)
-                        if latest_trade else None
+                        round(spot_quote['price'] - live_basis_trade['price'], 5)
+                        if live_basis_trade else None
                     ),
-                    'freshness_warning': (
-                        freshness_warning
-                    ),
+                    'freshness_warning': freshness_warning,
+                    'basis_alignment_warning': basis_alignment_warning,
                 })
                 if reference:
                     snapshot['reference_quote'] = {
@@ -3511,12 +3510,14 @@ def render_market_data_provenance(result, cfg):
     elif market_data.get('provider') == 'yahoo' and not market_data.get('is_live_quote'):
         st.warning('The latest Yahoo quote/candle is more than five minutes old; check your broker before execution.')
     if result.get('symbol') == 'XAUUSD':
+        if market_data.get('basis_alignment_warning'):
+            st.warning(market_data['basis_alignment_warning'])
         if market_data.get('provider') == 'gold_api_basis_estimate':
             st.info("The final XAUUSD price is a fresh Bitfinex XAUT/USD trade shifted by the Gold-API spot basis measured at analysis start. This is an estimate, not a direct broker spot/CFD quote.")
         elif market_data.get('provider') == 'bitfinex_basis_estimate':
             st.info("The final XAUUSD price is a fresh Gold-API spot quote converted to the unshifted Bitfinex XAUT/USD candle basis. This is an estimate, not a direct broker spot/CFD quote.")
         else:
-            st.info("XAUUSD uses keyless public feeds. The live reference is Gold-API XAU/USD; its candle history comes from Bitfinex XAUT/USD, shifted by the contemporaneous price difference. This is an estimated basis alignment, not an exact spot-candle conversion, and can differ from your broker's XAUUSD spot/CFD chart. Yahoo GC=F is a separate COMEX-futures cross-check.")
+            st.info("XAUUSD uses keyless public feeds. The live reference is Gold-API XAU/USD; its candle history comes from Bitfinex XAUT/USD and is shifted only when a recent Bitfinex trade verifies the spot basis. Otherwise, candles remain unadjusted. This is not an exact spot-candle conversion and can differ from your broker's XAUUSD spot/CFD chart. Yahoo GC=F is a separate COMEX-futures cross-check.")
 
 def render_signal_card(symbol, result, all_data):
     cfg = get_pair_config(symbol)
