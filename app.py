@@ -1148,6 +1148,8 @@ def score_volume_zone(snap, zone, direction, atr):
         zone_delta_pct = 100.0 * float(np.sum(allocated_volume * np.clip(close_location, -1.0, 1.0))) / zone_volume
         zone_body_pct = 100.0 * float(np.sum(allocated_volume * np.sign(close - open_price))) / zone_volume
         volume_share_pct = 100.0 * zone_volume / total_volume
+        buy_volume_proxy_pct = float(np.clip((100.0 + zone_delta_pct) / 2.0, 0.0, 100.0))
+        sell_volume_proxy_pct = 100.0 - buy_volume_proxy_pct
         touched = allocated_volume > 0
         zone_rvol = float(np.mean(allocated_volume[touched]) / np.mean(volume)) if touched.any() and np.mean(volume) > 0 else 0.0
         rejection = (close > top) if direction == 'BUY' else (close < bottom)
@@ -1202,6 +1204,9 @@ def score_volume_zone(snap, zone, direction, atr):
             'zone_delta_proxy_pct': round(zone_delta_pct, 1),
             'zone_body_pressure_pct': round(zone_body_pct, 1),
             'zone_control': 'BUYERS' if zone_pressure >= 0.08 else 'SELLERS' if zone_pressure <= -0.08 else 'BALANCED',
+            'buy_volume_proxy_pct': round(buy_volume_proxy_pct, 1),
+            'sell_volume_proxy_pct': round(sell_volume_proxy_pct, 1),
+            'net_volume_proxy_pct': round(zone_delta_pct, 1),
             'zone_volume_share_pct': round(volume_share_pct, 1),
             'zone_rvol': round(zone_rvol, 2),
             'directional_rejection_volume_pct': round(rejection_volume_pct, 1),
@@ -1243,10 +1248,17 @@ def score_multi_timeframe_volume_zone(volume_frames, zone, direction, atr):
     total_weight = sum(weight for _, weight in weighted)
     score = sum(value * weight for value, weight in weighted) / total_weight
     pressure_by_interval = {}
+    delta_by_interval = {}
     for label, item in observations.items():
         interval = item.get('bar_minutes') or label
         pressure_by_interval.setdefault(interval, []).append(item['aligned_pressure'])
+        delta_by_interval.setdefault(interval, []).append(item['zone_delta_proxy_pct'])
     pressure_values = [float(np.mean(values)) for values in pressure_by_interval.values()]
+    net_volume_proxy_pct = float(np.mean([
+        np.mean(values) for values in delta_by_interval.values()
+    ]))
+    buy_volume_proxy_pct = float(np.clip((100.0 + net_volume_proxy_pct) / 2.0, 0.0, 100.0))
+    sell_volume_proxy_pct = 100.0 - buy_volume_proxy_pct
     aligned_count = sum(value > 0.08 for value in pressure_values)
     opposing_count = sum(value < -0.08 for value in pressure_values)
     pullback_by_interval = {}
@@ -1277,6 +1289,12 @@ def score_multi_timeframe_volume_zone(volume_frames, zone, direction, atr):
         'opposing_timeframes': opposing_count,
         'unique_source_intervals': len(pressure_by_interval),
         'available_timeframes': list(observations),
+        'net_volume_proxy_pct': round(net_volume_proxy_pct, 1),
+        'buy_volume_proxy_pct': round(buy_volume_proxy_pct, 1),
+        'sell_volume_proxy_pct': round(sell_volume_proxy_pct, 1),
+        'volume_pressure': ('BUYERS' if net_volume_proxy_pct >= 8 else
+                            'SELLERS' if net_volume_proxy_pct <= -8 else 'BALANCED'),
+        'volume_pressure_basis': 'OHLCV close-location estimate; not actual aggressor-side volume',
     }
     summary = f"{aligned_count}/{len(pressure_by_interval)} source intervals aligned; {opposing_count} opposing; {retest_assessment}"
     return score, summary, details
@@ -2288,6 +2306,67 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
     plan['source'] = 'ATR_FALLBACK'
     return plan, audit
 
+def build_entry_watchlist(plan, audit, direction, cfg, limit=6):
+    """Keep possible entry locations visible even when the candidate is not trade-qualified."""
+    watchlist = []
+    seen = set()
+
+    def add_candidate(kind, timeframe, bottom, top, entry, zone_score, valid, reason, volume):
+        if entry is None or bottom is None or top is None:
+            return
+        key = (kind, round(float(entry), int(cfg.get('digits', 2))))
+        if key in seen:
+            return
+        seen.add(key)
+        watchlist.append({
+            'direction': direction,
+            'kind': kind,
+            'timeframe': timeframe,
+            'zone_bottom': float(min(bottom, top)),
+            'zone_top': float(max(bottom, top)),
+            'entry': float(entry),
+            'zone_score': zone_score,
+            'trade_plan_valid': bool(valid),
+            'candidate_status': 'structural candidate' if valid else 'watch only',
+            'candidate_note': reason or '',
+            'volume_pressure': volume.get('volume_pressure', 'UNAVAILABLE'),
+            'net_volume_proxy_pct': volume.get('net_volume_proxy_pct'),
+            'buy_volume_proxy_pct': volume.get('buy_volume_proxy_pct'),
+            'sell_volume_proxy_pct': volume.get('sell_volume_proxy_pct'),
+            'aligned_intervals': volume.get('aligned_timeframes', 0),
+            'opposing_intervals': volume.get('opposing_timeframes', 0),
+        })
+
+    if plan:
+        zone = plan.get('zone') or {}
+        add_candidate(
+            zone.get('kind', plan.get('source', 'Entry candidate')),
+            zone.get('tf', 'H1'),
+            zone.get('bottom'),
+            zone.get('top'),
+            plan.get('entry'),
+            zone.get('zone_score'),
+            plan.get('source') == 'HTF_STRUCTURE',
+            None if plan.get('source') == 'HTF_STRUCTURE' else 'ATR fallback; no ranked HTF zone was available',
+            plan.get('volume_confirmation') or {},
+        )
+
+    for row in audit or []:
+        add_candidate(
+            row.get('kind', 'HTF zone'),
+            row.get('tf', 'H1'),
+            row.get('bottom'),
+            row.get('top'),
+            row.get('entry'),
+            row.get('zone_score'),
+            row.get('valid', False),
+            row.get('reason') if not row.get('valid') else None,
+            row.get('volume_confirmation') or {},
+        )
+        if len(watchlist) >= limit:
+            break
+    return watchlist[:limit]
+
 
 # =============================================================================
 # ── V3 CORE: PLAN LIFECYCLE & PLAN LOCK ─────────────────────────────────────
@@ -2487,6 +2566,9 @@ def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy
         volume_evidence = row.get('volume_confirmation') or {}
         cand_lines.append(f"{n}. {row['kind']} {_fmt(row['bottom'], cfg)}-{_fmt(row['top'], cfg)} -> entry {_fmt(row['entry'], cfg)}, zone score {row['zone_score']}, "
                           f"{row['dist_atr']} ATR away, volume {row.get('volume_score', 'n/a')}/8, "
+                          f"zone pressure {volume_evidence.get('volume_pressure', 'UNAVAILABLE')} "
+                          f"(net {volume_evidence.get('net_volume_proxy_pct', 'n/a')}%, "
+                          f"buy/sell proxy {volume_evidence.get('buy_volume_proxy_pct', 'n/a')}/{volume_evidence.get('sell_volume_proxy_pct', 'n/a')}%), "
                           f"{volume_evidence.get('aligned_timeframes', 0)} aligned/{volume_evidence.get('opposing_timeframes', 0)} opposing source intervals, "
                           f"{'VALID' if row['valid'] else 'rejected: ' + row['reason']}")
     lv = ', '.join(f"{k} {_fmt(v, cfg)}" for k, v in levels.items()) or 'n/a'
@@ -2578,14 +2660,35 @@ def _plan_side_ok(direction, entry, price, min_gap):
     return (price - entry) >= min_gap * 0.999 if direction == 'BUY' else (entry - price) >= min_gap * 0.999
 
 def no_trade_result(result, reason):
-    """Keep weak candidates visible for diagnostics without presenting executable levels."""
+    """Keep watch-only entry candidates visible without presenting a trade signal."""
+    candidates = result.get('entry_candidates') or []
+    if not candidates and result.get('entry') is not None:
+        zone = result.get('zone') or {}
+        volume = result.get('volume_confirmation') or {}
+        candidates = build_entry_watchlist({
+            'source': result.get('levels_source'),
+            'entry': result.get('entry'),
+            'zone': {
+                **zone,
+                'kind': zone.get('kind', 'Fallback entry area'),
+                'tf': zone.get('tf', 'H1'),
+                'bottom': zone.get('bottom', result.get('entry')),
+                'top': zone.get('top', result.get('entry')),
+            },
+            'volume_confirmation': volume,
+        }, result.get('candidates'), result.get('signal', 'WAIT'), {'digits': 5})
+    primary = candidates[0] if candidates else {}
     result.update({
+        'candidate_direction': result.get('signal'),
         'signal': 'WAIT',
         'confidence': 'LOW',
         'grade': 'NO TRADE',
         'plan_state': 'WAIT',
         'plan_status': 'NOT_CREATED',
         'no_trade_reason': reason,
+        'suggested_entry': primary.get('entry', result.get('entry')),
+        'suggested_zone': primary or result.get('zone'),
+        'entry_candidates': candidates,
         'entry': None,
         'stop_loss': None,
         'take_profit': [],
@@ -2658,6 +2761,7 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
                               f"TP1 {_fmt(plan['take_profit'][0], cfg)} | TP2 {_fmt(plan['take_profit'][1], cfg)} | valid ~{cfg['plan_expiry_hours']}h."),
         'zone': plan['zone'], 'htf_bias': bias, 'score_breakdown': plan['score_breakdown'],
         'python_score': int(plan['score']), 'candidates': audit[:6], 'levels_source': plan.get('source', 'HTF_STRUCTURE'),
+        'entry_candidates': build_entry_watchlist(plan, audit, plan['direction'], cfg),
         'tp1_structural': plan.get('tp1_structural'), 'tp2_structural': plan.get('tp2_structural'),
         'sl_anchor': plan['sl_anchor'], 'tp1_kind': plan['tp1_kind'], 'tp2_kind': plan['tp2_kind'], 'ltf_refs': plan.get('ltf_refs', []),
         'python_validation_notes': notes, 'risk_flags': risk_flags, 'market_closed': market_closed,
@@ -2801,6 +2905,12 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 volume_zone['entry'] = float(live_existing['entry'])
                 _, _, result['volume_confirmation'] = score_multi_timeframe_volume_zone(
                     snaps.get('_volume_frames') or {}, volume_zone, live_existing['direction'], atr_h1)
+                result['entry_candidates'] = build_entry_watchlist({
+                    'source': result.get('levels_source', 'HTF_STRUCTURE'),
+                    'entry': live_existing['entry'],
+                    'zone': locked_zone,
+                    'volume_confirmation': result['volume_confirmation'],
+                }, result.get('candidates'), live_existing['direction'], cfg)
                 result['volume_analysis_by_tf'] = {}
                 for timeframe, frame in (snaps.get('_volume_frames') or {}).items():
                     micro = frame.get('micro') or {}
@@ -3023,12 +3133,34 @@ def render_signal_card(symbol, result, all_data):
     cfg = get_pair_config(symbol)
     sig = result.get('signal')
     if sig == 'WAIT':
-        st.markdown(f"### ⏸️ {symbol} — WAIT · No trade published")
-        st.info(f"**Why the setup was rejected:** {result.get('no_trade_reason', 'The setup did not meet the high-confidence rules.')}")
+        st.markdown(f"### ⏸️ {symbol} — WAIT · Entry watchlist")
+        st.info(f"**Trade filter:** {result.get('no_trade_reason', 'The candidate does not currently meet the high-confidence rules.')}")
         st.write(f"**Candidate score:** {result.get('confluence_score', 0)}/100 · **HTF bias:** {(result.get('htf_bias') or {}).get('word', 'n/a')} · **Volume evidence:** {(result.get('volume_confirmation') or {}).get('retest_assessment', 'n/a')}")
+        entry_candidates = result.get('entry_candidates') or []
+        if entry_candidates:
+            st.caption("Watch-only levels, not executable signals. Wait for price action confirmation; the volume split below is an OHLCV estimate.")
+            st.dataframe(pd.DataFrame([{
+                'Side': item.get('direction'),
+                'Zone': item.get('kind'),
+                'TF': item.get('timeframe'),
+                'Watch range': f"{_fmt(item.get('zone_bottom'), cfg)}–{_fmt(item.get('zone_top'), cfg)}",
+                'Candidate entry': _fmt(item.get('entry'), cfg),
+                'Volume proxy': item.get('volume_pressure', 'UNAVAILABLE'),
+                'Net volume proxy %': item.get('net_volume_proxy_pct'),
+                'Buy / sell proxy %': (
+                    f"{item.get('buy_volume_proxy_pct')} / {item.get('sell_volume_proxy_pct')}"
+                    if item.get('buy_volume_proxy_pct') is not None else 'n/a'
+                ),
+                'Aligned / opposing intervals': (
+                    f"{item.get('aligned_intervals', 0)} / {item.get('opposing_intervals', 0)}"
+                ),
+                'Status': item.get('candidate_status'),
+            } for item in entry_candidates]), hide_index=True, use_container_width=True)
+        else:
+            st.warning("No candidate levels could be calculated from the available closed-candle data.")
         if result.get('risk_flags'):
             st.warning('⚠️ AI risk flags: ' + '; '.join(result['risk_flags']))
-        st.caption("A WAIT is intentional: this engine does not claim that a future pullback price or institutional resting order can be known exactly.")
+        st.caption("The app can identify candidate areas, but cannot know whether price will revisit them or verify institutional resting orders from candle volume.")
         return
     icon = '🟢' if sig == 'BUY' else '🔴'
     state = result.get('plan_state', 'NEW')
@@ -3065,6 +3197,12 @@ def render_signal_card(symbol, result, all_data):
             retest_levels = confirmation.get('retest_levels') or {}
             st.write(f"**Potential retracement:** {_fmt(retest_levels.get('zone_bottom'), cfg)}–{_fmt(retest_levels.get('zone_top'), cfg)} · planned LIMIT {_fmt(retest_levels.get('limit_entry'), cfg)}")
             st.write(f"**Reload assessment:** {confirmation.get('retest_assessment', 'n/a')} · score {confirmation.get('score', 0)}/8")
+            st.write(
+                f"**Zone volume proxy:** {confirmation.get('volume_pressure', 'UNAVAILABLE')} · "
+                f"net {confirmation.get('net_volume_proxy_pct', 'n/a')}% · "
+                f"estimated buy/sell split {confirmation.get('buy_volume_proxy_pct', 'n/a')}% / "
+                f"{confirmation.get('sell_volume_proxy_pct', 'n/a')}%"
+            )
             volume_rows = []
             for timeframe in ('M10', 'M15', 'M30', 'H1', 'H4'):
                 metrics = volume_by_tf.get(timeframe)
@@ -3078,6 +3216,8 @@ def render_signal_card(symbol, result, all_data):
                     'TF delta %': metrics.get('net_volume_proxy_pct'),
                     'Zone control': zone_metrics.get('zone_control', 'n/a'),
                     'Zone delta %': zone_metrics.get('zone_delta_proxy_pct'),
+                    'Buy volume proxy %': zone_metrics.get('buy_volume_proxy_pct'),
+                    'Sell volume proxy %': zone_metrics.get('sell_volume_proxy_pct'),
                     'Reject vol %': zone_metrics.get('directional_rejection_volume_pct'),
                     'Zone RVOL': zone_metrics.get('zone_rvol'),
                     'Pullback/impulse vol': zone_metrics.get('pullback_vs_impulse_volume_ratio'),
@@ -3112,17 +3252,21 @@ def render_signal_card(symbol, result, all_data):
             st.dataframe(df_bd, hide_index=True, use_container_width=True)
         st.caption(f"Python score {result.get('python_score', '-')} → final {result.get('confluence_score')} (AI auditor may adjust ±6; it can never change direction or levels).")
     with st.expander('🔎 Entry candidates the engine compared'):
-        rows = result.get('candidates') or []
+        rows = result.get('entry_candidates') or []
         if rows:
             st.dataframe(pd.DataFrame([{
-                'Zone': r.get('kind'), 'Range': f"{_fmt(r.get('bottom'), cfg)}–{_fmt(r.get('top'), cfg)}", 'Limit entry': _fmt(r.get('entry'), cfg),
-                'Zone score': r.get('zone_score'), 'ATR away': r.get('dist_atr'), 'Tested': r.get('touches'),
-                'Plan score': r.get('score', '—'), 'Volume score': r.get('volume_score'),
-                'TF flow aligned/opposed': f"{(r.get('volume_confirmation') or {}).get('aligned_timeframes', 0)}/{(r.get('volume_confirmation') or {}).get('opposing_timeframes', 0)}",
-                'Result': 'chosen/valid' if r.get('valid') else r.get('reason'),
+                'Zone': r.get('kind'), 'Range': f"{_fmt(r.get('zone_bottom'), cfg)}–{_fmt(r.get('zone_top'), cfg)}",
+                'Candidate entry': _fmt(r.get('entry'), cfg), 'Zone score': r.get('zone_score'),
+                'Volume pressure': r.get('volume_pressure'), 'Net volume proxy %': r.get('net_volume_proxy_pct'),
+                'Buy / sell proxy %': (
+                    f"{r.get('buy_volume_proxy_pct')} / {r.get('sell_volume_proxy_pct')}"
+                    if r.get('buy_volume_proxy_pct') is not None else 'n/a'
+                ),
+                'Aligned / opposing intervals': f"{r.get('aligned_intervals', 0)}/{r.get('opposing_intervals', 0)}",
+                'Result': r.get('candidate_status') + (f": {r.get('candidate_note')}" if r.get('candidate_note') else ''),
             } for r in rows]), hide_index=True, use_container_width=True)
         else:
-            st.caption('No HTF zone was in reach on the correct side of price.')
+            st.caption('No candidate entry zones were generated from the available data.')
     try:
         h1_df = (all_data.get(symbol, {}) or {}).get('H1')
         if h1_df is not None and not h1_df.empty:
