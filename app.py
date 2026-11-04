@@ -2556,14 +2556,26 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
         if plan is not None:
             score, breakdown, candle_notes, volume_evidence = score_plan(direction, plan, z, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
             plan['zone'] = {'kind': z['kind'], 'tf': z['tf'], 'top': z['top'], 'bottom': z['bottom'],
-                            'touches': z['touches'], 'confluence': z['confluence'], 'zone_score': z['zone_score']}
+                            'touches': z['touches'], 'confluence': z['confluence'], 'zone_score': z['zone_score'],
+                            'dist_atr': z['dist_atr']}
             plan['score'], plan['score_breakdown'], plan['candle_notes'] = score, breakdown, candle_notes
             plan['volume_confirmation'] = volume_evidence
             row['score'] = score
             valid.append(plan)
         audit.append(row)
     if valid:
-        best = max(valid, key=lambda p: (p['score'], p['zone']['zone_score']))
+        best = max(
+            valid,
+            key=lambda p: (
+                p['score'],
+                (p.get('volume_confirmation') or {}).get('score', 4.0),
+                p['zone']['zone_score'],
+                -float(p['zone'].get('dist_atr', 0.0)),
+                p['zone']['tf'],
+                p['zone']['kind'],
+                -float(p['entry']),
+            ),
+        )
         best['source'] = 'HTF_STRUCTURE'
         return best, audit
     entry = compute_fallback_atr_plan_levels(direction, price, atr_h1, cfg)
@@ -2725,6 +2737,16 @@ def evaluate_plan_lifecycle(plan, price_df, live_price=None, now=None):
         if age_h > float(plan.get('expiry_hours', 18)):
             _close_plan(plan, 'EXPIRED', now.isoformat(), events)
     return events
+
+def existing_plan_action(plan, direction, force_new=False):
+    """Keep live plans stable; only pending plans can be explicitly overridden."""
+    if not plan or plan.get('status') not in LIVE_PLAN_STATUSES:
+        return 'NEW'
+    if plan.get('status') == 'FILLED':
+        return 'REUSED' if plan.get('direction') == direction else 'OPEN_TRADE_CONFLICT'
+    if force_new or plan.get('direction') != direction:
+        return 'NEW'
+    return 'REUSED'
 
 def describe_plan_event(plan, ev):
     sym, side = plan.get('symbol'), plan.get('direction')
@@ -3137,11 +3159,21 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         events = []
         existing = state['plans'].get(symbol)
         if existing and existing.get('status') in LIVE_PLAN_STATUSES:
-            events += evaluate_plan_lifecycle(existing, m10, live_price=current_price)
-            if existing.get('status') == 'PENDING':
-                _, max_gap = htf_entry_gap_bounds(current_price, atr_h1, cfg)
-                if abs(current_price - float(existing['entry'])) > 1.25 * max_gap:
-                    _close_plan(existing, 'STALE', utc_now().isoformat(), events)
+            lifecycle_m10 = m10
+            if symbol == 'XAUUSD':
+                locked_market = ((existing.get('result') or {}).get('market_data') or {})
+                locked_basis = locked_market.get('analysis_candle_basis_adjustment')
+                current_basis = live_snapshot.get('analysis_candle_basis_adjustment')
+                if locked_basis is not None and current_basis is not None:
+                    basis_delta = float(locked_basis) - float(current_basis)
+                    if basis_delta:
+                        lifecycle_m10 = m10.copy()
+                        for column in ('Open', 'High', 'Low', 'Close'):
+                            if column in lifecycle_m10:
+                                lifecycle_m10[column] = pd.to_numeric(
+                                    lifecycle_m10[column], errors='coerce'
+                                ) + basis_delta
+            events += evaluate_plan_lifecycle(existing, lifecycle_m10, live_price=current_price)
         if events and existing:
             push_plan_events(symbol, existing, events)
 
@@ -3151,30 +3183,17 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         dxy_rel = dxy_relation(symbol, direction, dxy)
 
         live_existing = existing if (existing and existing.get('status') in LIVE_PLAN_STATUSES) else None
-        plan_state = 'NEW'
-        if live_existing and not force_new:
-            if live_existing['direction'] == direction:
-                provisional = live_existing.get('status') == 'PENDING' and not live_existing.get('sent')
-                if not provisional:
-                    plan_state = 'REUSED'
-                else:
-                    plan_state = 'PROVISIONAL'
-            else:
-                if live_existing['status'] == 'PENDING':
-                    live_existing['cancel_reason'] = f"HTF bias flipped to {direction} ({bias['score']:+.0f})"
-                    ev = []
-                    _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), ev)
-                    push_plan_events(symbol, live_existing, ev)
-                    live_existing = None
-                    plan_state = 'NEW'
-                else:
-                    plan_state = 'OPEN_TRADE_CONFLICT'
-        elif live_existing and force_new:
-            if live_existing['status'] == 'PENDING':
+        plan_state = existing_plan_action(live_existing, direction, force_new)
+        if live_existing and plan_state == 'NEW':
+            if force_new:
                 live_existing['cancel_reason'] = 'manual "force fresh plan" override'
                 _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), [], ledger=False)
-                live_existing = None
-            plan_state = 'NEW'
+            else:
+                live_existing['cancel_reason'] = f"HTF bias flipped to {direction} ({bias['score']:+.0f})"
+                ev = []
+                _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), ev)
+                push_plan_events(symbol, live_existing, ev)
+            live_existing = None
 
         def _reuse_result(label):
             result = dict(live_existing.get('result') or {})
@@ -3187,6 +3206,7 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             result['gap_to_entry'] = round(abs(current_price - float(live_existing['entry'])), cfg['digits'])
             locked_zone = result.get('zone') or live_existing.get('zone') or {}
             if locked_zone.get('bottom') is not None and locked_zone.get('top') is not None:
+                result['selection_volume_confirmation'] = result.get('volume_confirmation') or {}
                 volume_zone = dict(locked_zone)
                 volume_zone['entry'] = float(live_existing['entry'])
                 _, _, result['volume_confirmation'] = score_multi_timeframe_volume_zone(
@@ -3309,7 +3329,7 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         result['quality_warnings'] = signal_quality_warnings({
             **plan, 'python_score': plan.get('score'), 'score': result['confluence_score']
         }, bias)
-        result['plan_state'] = 'REPLANNED' if plan_state == 'PROVISIONAL' else 'NEW'
+        result['plan_state'] = 'NEW'
         result['plan_status'] = 'PENDING'
         result['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         result['events'] = events
@@ -3319,9 +3339,6 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             result['python_validation_notes'].append(f"Math check: {reason}")
 
         # ── 6. Lock the plan ─────────────────────────────────────────────────────────
-        if live_existing and plan_state == 'PROVISIONAL':
-            live_existing['cancel_reason'] = 'replaced by a higher-quality plan in the same direction'
-            _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), [], ledger=False)
         lock_result = to_jsonable({k: v for k, v in result.items() if k not in ('events', 'model_attempts')})
         state['plans'][symbol] = {
             'plan_id': uuid.uuid4().hex[:8], 'symbol': symbol, 'direction': direction, 'status': 'PENDING',
@@ -3330,7 +3347,10 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             'score': result['confluence_score'], 'grade': result['grade'], 'zone': to_jsonable(plan['zone']),
             'sent': False, 'result': lock_result,
         }
-        save_state()
+        if not save_state():
+            return {
+                'error': 'The setup was calculated but could not be saved as a persistent plan lock. No signal was published; check the app state-file permissions and retry.'
+            }
         return result
     except Exception as e:
         traceback.print_exc()
@@ -3538,8 +3558,10 @@ def render_signal_card(symbol, result, all_data):
     st.caption(f"{STATE_LABELS.get(state, state)} · plan status: {result.get('plan_status', 'PENDING')} · live price {_fmt(result.get('live_price'), cfg)}")
     render_market_data_provenance(result, cfg)
     if state == 'REUSED':
-        st.info("This plan was created earlier and is still valid (not filled, not invalidated, HTF bias unchanged). "
-                "The engine deliberately does NOT invent a fresh signal from a new candle. Tick “Force fresh plan” to override.")
+        if result.get('plan_status') == 'FILLED':
+            st.info("The existing trade is still open. Its entry, stop, and targets remain locked; a fresh-plan override cannot replace an open trade.")
+        else:
+            st.info("This pending setup remains locked across analysis runs, even if it has not been sent. New candles or volume scores alone will not replace it; the lock ends when the setup resolves, expires, the HTF bias flips, or you explicitly override it.")
     if result.get('market_closed'):
         st.warning("Market appears closed for this symbol — the plan is stored but won't be pushed to Telegram.")
     tps = result.get('take_profit') or [None, None]
@@ -3564,9 +3586,15 @@ def render_signal_card(symbol, result, all_data):
     with st.expander('📊 Volume profile & pressure evidence'):
         volume_by_tf = result.get('volume_analysis_by_tf') or {}
         confirmation = result.get('volume_confirmation') or {}
+        selection_confirmation = result.get('selection_volume_confirmation') or {}
         if volume_by_tf:
             if result.get('volume_context_is_advisory'):
                 st.caption('Volume context refreshed from current candles; the locked plan levels and original score are unchanged.')
+                st.caption(
+                    f"Volume evidence when this plan was selected: "
+                    f"{(selection_confirmation.get('retest_assessment') or 'not recorded')} "
+                    f"(score {selection_confirmation.get('score', 'n/a')}/8)."
+                )
             retest_levels = confirmation.get('retest_levels') or {}
             st.write(f"**Potential retracement:** {_fmt(retest_levels.get('zone_bottom'), cfg)}–{_fmt(retest_levels.get('zone_top'), cfg)} · planned LIMIT {_fmt(retest_levels.get('limit_entry'), cfg)}")
             st.write(f"**Reload assessment:** {confirmation.get('retest_assessment', 'n/a')} · score {confirmation.get('score', 0)}/8")
@@ -3656,8 +3684,8 @@ with tab1:
     st.header("🚀 Run AI Market Analysis")
     selected_symbols = st.multiselect("Select Symbols to Analyse", SYMBOLS, default=['XAUUSD', 'EURUSD', 'BTCUSD'])
     opt1, opt2 = st.columns(2)
-    force_new = opt1.checkbox("Force fresh plan (ignore plan lock)", value=False,
-                              help="Normally an existing valid plan is kept. Tick this only if you want the engine to rebuild from scratch.")
+    force_new = opt1.checkbox("Force fresh plan (override pending plan lock)", value=False,
+                              help="This deliberately cancels a pending setup and builds a different one. It cannot replace an already-filled trade.")
     use_ai = opt2.checkbox("Use AI risk auditor (Groq)", value=True,
                            help="The Python engine decides direction and levels. The AI only audits, flags risks, reads your screenshot and adjusts the score by at most ±6.")
     uploaded_file = st.file_uploader("📸 Attach Market Chart Screenshot (Optional - the AI auditor will read it)", type=["png", "jpg", "jpeg"])
