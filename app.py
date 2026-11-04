@@ -1165,6 +1165,18 @@ def reset_state():
     st.session_state.persist_state = _default_state()
     save_state()
 
+def reset_bias_keep_plans():
+    state = load_state()
+    active_symbols = {
+        symbol for symbol, plan in state['plans'].items()
+        if plan.get('status') in LIVE_PLAN_STATUSES
+    }
+    state['bias'] = {
+        symbol: bias for symbol, bias in state['bias'].items()
+        if symbol in active_symbols
+    }
+    return save_state()
+
 # =============================================================================
 # ── V3 CORE: CANDLE HYGIENE & INDICATORS ────────────────────────────────────
 # =============================================================================
@@ -2523,7 +2535,7 @@ def signal_quality_warnings(plan, bias, minimum_score=MINIMUM_CONFLUENCE_SCORE):
     opposing = int(volume.get('opposing_timeframes') or 0)
     if int(volume.get('unique_source_intervals') or 0) < MINIMUM_ALIGNED_VOLUME_INTERVALS:
         warnings.append('Volume history is limited across distinct bar intervals')
-    if opposing > aligned:
+    if opposing > 0 and opposing >= aligned:
         warnings.append(f"Volume pressure conflicts with the setup ({aligned} aligned, {opposing} opposing intervals)")
     elif aligned < MINIMUM_ALIGNED_VOLUME_INTERVALS:
         warnings.append(f"Volume pressure is not independently confirmed across {MINIMUM_ALIGNED_VOLUME_INTERVALS} intervals")
@@ -2737,13 +2749,13 @@ def evaluate_plan_lifecycle(plan, price_df, live_price=None, now=None):
             _close_plan(plan, 'EXPIRED', now.isoformat(), events)
     return events
 
-def existing_plan_action(plan, direction, force_new=False):
-    """Keep live plans stable; only pending plans can be explicitly overridden."""
+def existing_plan_action(plan, direction, force_new=False, bias_flip_confirmed=False):
+    """Keep pending plans stable until an explicit override or confirmed HTF bias flip."""
     if not plan or plan.get('status') not in LIVE_PLAN_STATUSES:
         return 'NEW'
     if plan.get('status') == 'FILLED':
         return 'REUSED' if plan.get('direction') == direction else 'OPEN_TRADE_CONFLICT'
-    if force_new or plan.get('direction') != direction:
+    if force_new or (plan.get('direction') != direction and bias_flip_confirmed):
         return 'NEW'
     return 'REUSED'
 
@@ -3182,7 +3194,12 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         dxy_rel = dxy_relation(symbol, direction, dxy)
 
         live_existing = existing if (existing and existing.get('status') in LIVE_PLAN_STATUSES) else None
-        plan_state = existing_plan_action(live_existing, direction, force_new)
+        confirmed_bias_flip = any(
+            note.startswith('BIAS FLIPPED') for note in bias.get('notes', [])
+        )
+        plan_state = existing_plan_action(
+            live_existing, direction, force_new, bias_flip_confirmed=confirmed_bias_flip
+        )
         if live_existing and plan_state == 'NEW':
             if force_new:
                 live_existing['cancel_reason'] = 'manual "force fresh plan" override'
@@ -3235,6 +3252,12 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 'tp1_structural': result.get('tp1_structural'),
                 'volume_confirmation': result.get('volume_confirmation'),
             }, bias)
+            if label == 'REUSED' and live_existing.get('direction') != direction:
+                result.setdefault('python_validation_notes', [])
+                result['python_validation_notes'].append(
+                    f"Pending {live_existing['direction']} setup remains locked; current raw HTF read is {direction}, "
+                    "but the bias engine has not confirmed a flip."
+                )
             if label == 'OPEN_TRADE_CONFLICT':
                 result.setdefault('python_validation_notes', [])
                 msg = f"HTF bias is now {direction} but the {live_existing['direction']} trade is already FILLED and open — manage it (SL/TP unchanged). A new plan will be built after it closes."
@@ -3362,6 +3385,27 @@ def should_send_to_telegram(result):
         return False, 'market appears closed - plan stored but not pushed'
     if result.get('signal') not in ('BUY', 'SELL'):
         return False, 'no directional plan is available'
+    blockers = []
+    python_score = int(result.get('python_score') or 0)
+    final_score = int(result.get('confluence_score') or 0)
+    if min(python_score, final_score) < MINIMUM_CONFLUENCE_SCORE:
+        blockers.append(f"score below {MINIMUM_CONFLUENCE_SCORE}/100")
+    bias = result.get('htf_bias') or {}
+    if not bias.get('aligned') or bias.get('low_conviction'):
+        blockers.append('H4/H1 bias is not firmly aligned')
+    if result.get('levels_source') != 'HTF_STRUCTURE':
+        blockers.append('no ranked higher-timeframe entry zone')
+    if not result.get('tp1_structural'):
+        blockers.append('TP1 is not a structural target')
+    volume = result.get('volume_confirmation') or {}
+    aligned = int(volume.get('aligned_timeframes') or 0)
+    opposing = int(volume.get('opposing_timeframes') or 0)
+    if int(volume.get('unique_source_intervals') or 0) < MINIMUM_ALIGNED_VOLUME_INTERVALS:
+        blockers.append('insufficient distinct volume intervals')
+    if aligned < MINIMUM_ALIGNED_VOLUME_INTERVALS or opposing >= aligned:
+        blockers.append('volume proxy does not confirm the direction across independent intervals')
+    if blockers:
+        return False, 'high-conviction gate: ' + '; '.join(blockers)
     valid, reason = validate_signal_math(result, pair_config=get_pair_config(result.get('symbol', 'XAUUSD')))
     if not valid:
         return False, f"plan failed the execution-math check: {reason}"
@@ -3882,8 +3926,8 @@ with tab5:
         f"2. **Hysteresis.** A standing bias only flips with a score beyond ±{BIAS_FLIP_THRESHOLD:.0f}, an opposing H1/H4 close-based structure break, and at least {BIAS_MIN_HOLD_HOURS:.0f}h since it was set.\n"
         "3. **Entry = best HTF zone.** Unmitigated H4/H1 order blocks, open FVGs, 62–79% OTE, live swings, equal highs/lows, prior-period levels and estimated OHLCV volume-POC retests are ranked; M30/M15 then refine the limit *inside* the zone.\n"
         "4. **SL/TP are structural.** SL beyond the zone's distal edge (and any live swing just beyond) with an H1-ATR buffer; TP1/TP2 are the next opposing HTF levels that pay at least 1.5R.\n"
-        "5. **Best executable candidate.** Evaluate all available ranked H4/H1 zones, then publish the highest composite-score calculable plan even when volume or timeframe evidence conflicts; conflicts lower its confidence and appear as warnings rather than suppressing the entry. This score is not a calibrated probability.\n"
-        "6. **Plan lock.** One plan per symbol is created and managed until it resolves — reruns return the same plan.\n"
+        "5. **Quality gate.** Only auto-send a plan when the rule-based score meets the high-confidence threshold, H4/H1 agree, the entry and TP1 are structural, and volume proxies align across distinct intervals. OHLCV volume is an estimate, not actual aggressor-side flow or proof of resting orders; the score is not a calibrated probability.\n"
+        "6. **Plan lock.** One pending plan per symbol stays fixed until it resolves, expires, is explicitly overridden, or the bias engine confirms a flip — a raw direction change alone does not replace it.\n"
         "7. **AI is an auditor.** It cannot change direction or levels; it flags risks, reads screenshots and adjusts the score by ±6. Scores are rule-based confluence, not calibrated win probabilities."
     )
     st.markdown(f"- **AI model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
@@ -3891,11 +3935,16 @@ with tab5:
     st.markdown(f"- **State file:** `{STATE_PATH}` (set `DERAI_STATE_PATH` to change it; on Streamlit Community Cloud the disk resets when the app is rebuilt/restarted)")
     st.markdown("---")
     st.subheader("Telegram & scoring")
-    st.caption("All new BUY/SELL plans that pass the execution-math check can be sent, regardless of score; review the confidence grade and quality warnings before acting.")
+    st.caption(f"Telegram sends require at least {MINIMUM_CONFLUENCE_SCORE}/100 from both the Python and final scores, aligned H4/H1 bias, structural entry/TP1, and volume-proxy confirmation from at least {MINIMUM_ALIGNED_VOLUME_INTERVALS} distinct intervals. Lower-confidence plans remain visible for review but are not auto-sent.")
     st.checkbox("Send plan events (filled / TP / SL / cancelled / missed / expired) to Telegram", value=True, key="notify_plan_events")
-    if st.button("🧹 Reset stored bias, plans and ledger"):
+    if st.button("🧭 Reset stored bias only (preserve active plans)"):
+        if reset_bias_keep_plans():
+            st.success("Bias reset for symbols without active plans. Active plans and their standing bias remain locked.")
+        else:
+            st.error("Could not save the bias reset; check the app state-file permissions.")
+    if st.button("🧹 Reset ALL stored bias, plans and ledger"):
         reset_state()
-        st.success("Stored bias, plans and ledger cleared.")
+        st.success("All stored bias, plans and ledger cleared. New analyses may select different setups.")
     st.markdown("---")
     st.subheader("🔧 Groq Model Diagnostics")
     st.caption("GROQ_MODELS is always tried in the order below. Use this panel to see what your key reports as available.")
