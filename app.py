@@ -124,10 +124,6 @@ if 'groq_rate_limit_until' not in st.session_state: st.session_state.groq_rate_l
 if 'groq_rate_limit_reason' not in st.session_state: st.session_state.groq_rate_limit_reason = ''
 if 'cached_analysis' not in st.session_state: st.session_state.cached_analysis = {}
 if 'last_model_attempts' not in st.session_state: st.session_state.last_model_attempts = {}
-st.session_state.min_send_score = max(
-    MINIMUM_CONFLUENCE_SCORE,
-    int(st.session_state.get('min_send_score', MINIMUM_CONFLUENCE_SCORE) or MINIMUM_CONFLUENCE_SCORE),
-)
 
 if 'persist_state' not in st.session_state: st.session_state.persist_state = None
 if 'notify_plan_events' not in st.session_state: st.session_state.notify_plan_events = True
@@ -2229,29 +2225,32 @@ def grade_for(score):
 def confidence_for(score):
     return 'HIGH' if score >= 82 else 'MEDIUM' if score >= 72 else 'LOW'
 
-def signal_quality_rejection(plan, bias, minimum_score=MINIMUM_CONFLUENCE_SCORE):
-    """Return why a candidate must remain a wait rather than be published as a trade."""
+def signal_quality_warnings(plan, bias, minimum_score=MINIMUM_CONFLUENCE_SCORE):
+    """Report quality concerns without suppressing a calculable trade plan."""
+    warnings = []
     if bias.get('low_conviction') or not bias.get('aligned'):
-        return 'H4 and H1 do not provide aligned, non-low-conviction direction'
+        warnings.append('H4 and H1 are not fully aligned; directional bias is lower conviction')
     if plan.get('source') != 'HTF_STRUCTURE':
-        return 'no valid higher-timeframe structural entry zone'
+        warnings.append('No ranked higher-timeframe entry zone was in reach; using the ATR fallback')
     if not plan.get('tp1_structural'):
-        return 'TP1 is an R-multiple projection rather than a structural target'
+        warnings.append('TP1 is an R-multiple projection rather than a structural target')
     python_score = int(plan.get('python_score', plan.get('score', 0)) or 0)
     if python_score < int(minimum_score):
-        return f"Python score {python_score} is below the high-confidence threshold of {minimum_score}"
+        warnings.append(f"Python score {python_score} is below the high-confidence reference of {minimum_score}")
     if int(plan.get('score') or 0) < int(minimum_score):
-        return f"score {plan.get('score', 0)} is below the high-confidence threshold of {minimum_score}"
+        warnings.append(f"Final score {plan.get('score', 0)} is below the high-confidence reference of {minimum_score}")
     volume = plan.get('volume_confirmation') or {}
     aligned = int(volume.get('aligned_timeframes') or 0)
     opposing = int(volume.get('opposing_timeframes') or 0)
     if int(volume.get('unique_source_intervals') or 0) < MINIMUM_ALIGNED_VOLUME_INTERVALS:
-        return f"fewer than {MINIMUM_ALIGNED_VOLUME_INTERVALS} distinct bar intervals confirm the entry"
-    if aligned < MINIMUM_ALIGNED_VOLUME_INTERVALS or aligned <= opposing:
-        return 'volume pressure does not align across multiple independent intervals'
-    return None
+        warnings.append('Volume history is limited across distinct bar intervals')
+    if opposing > aligned:
+        warnings.append(f"Volume pressure conflicts with the setup ({aligned} aligned, {opposing} opposing intervals)")
+    elif aligned < MINIMUM_ALIGNED_VOLUME_INTERVALS:
+        warnings.append(f"Volume pressure is not independently confirmed across {MINIMUM_ALIGNED_VOLUME_INTERVALS} intervals")
+    return warnings
 
-def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime, max_eval=8):
+def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime, max_eval=None):
     """Rank HTF zones, refine each with LTF, build SL/TP, score, and return the best VALID plan
     plus a full audit trail of every candidate (so you can see why one zone beat the others)."""
     zones = collect_entry_zones(direction, snaps, levels, atr_h1, cfg)
@@ -2259,7 +2258,8 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
     min_gap, _ = htf_entry_gap_bounds(price, atr_h1, cfg)
     ltf_snaps = [('M30', snaps.get('M30')), ('M15', snaps.get('M15'))]
     audit, valid = [], []
-    for z in ranked[:max_eval]:
+    candidates_to_evaluate = ranked if max_eval is None else ranked[:max_eval]
+    for z in candidates_to_evaluate:
         entry, names = z['entry'], []
         refined, ref_names = refine_entry_with_ltf(direction, z, ltf_snaps, atr_h1, price, min_gap)
         if refined is not None:
@@ -2306,8 +2306,8 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
     plan['source'] = 'ATR_FALLBACK'
     return plan, audit
 
-def build_entry_watchlist(plan, audit, direction, cfg, limit=6):
-    """Keep possible entry locations visible even when the candidate is not trade-qualified."""
+def build_entry_watchlist(plan, audit, direction, cfg, limit=10):
+    """Keep alternative entry locations visible alongside the selected executable plan."""
     watchlist = []
     seen = set()
 
@@ -2562,7 +2562,7 @@ def build_plan_reasoning(symbol, plan, bias, cfg, live_price):
 
 def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy, dxy_rel, levels):
     cand_lines = []
-    for n, row in enumerate(audit[:5], 1):
+    for n, row in enumerate(audit[:10], 1):
         volume_evidence = row.get('volume_confirmation') or {}
         cand_lines.append(f"{n}. {row['kind']} {_fmt(row['bottom'], cfg)}-{_fmt(row['top'], cfg)} -> entry {_fmt(row['entry'], cfg)}, zone score {row['zone_score']}, "
                           f"{row['dist_atr']} ATR away, volume {row.get('volume_score', 'n/a')}/8, "
@@ -2598,7 +2598,7 @@ LOCKED PLAN: {plan['direction']} LIMIT | entry {_fmt(plan['entry'], cfg)} | SL {
 CHOSEN ZONE: {plan['zone']['kind']} {_fmt(plan['zone']['bottom'], cfg)}-{_fmt(plan['zone']['top'], cfg)}; confluence: {', '.join(plan['zone'].get('confluence') or []) or 'none'}; LTF refinement: {', '.join(plan.get('ltf_refs') or []) or 'none'}
 CHOSEN ZONE VOLUME CONFIRMATION: {json.dumps(plan.get('volume_confirmation') or {})}
 PYTHON SCORE: {plan['score']}/100 -> {json.dumps(plan['score_breakdown'])}
-QUALITY RULE: A publishable setup requires aligned, non-low-conviction H4/H1 bias, a valid structural or estimated volume-POC retest zone, a structural TP1, Python and final scores >= {MINIMUM_CONFLUENCE_SCORE}, and directional pressure from at least {MINIMUM_ALIGNED_VOLUME_INTERVALS} distinct bar intervals. If any requirement is unmet, identify the missing evidence and recommend WAIT; do not make a setup sound certain.
+QUALITY RULE: Always audit the best ranked executable candidate. H4/H1 alignment, structural entry/target, score, and agreement across volume indicators and distinct bar intervals affect its quality grade and risk warnings; they do not erase the candidate. Describe disagreements precisely and do not claim a calibrated probability or guaranteed outcome.
 HTF BIAS ({bias['word']}, score {bias['score']:+.0f}): {' | '.join(bias['evidence'][:8])}. {' '.join(bias['notes'])}
 H4: {describe_snapshot(snaps.get('H4'), cfg)}
 H1: {describe_snapshot(snaps.get('H1'), cfg)}
@@ -2614,7 +2614,7 @@ RANKED HTF ENTRY CANDIDATES:
 {chr(10).join(cand_lines) or 'none'}
 
 TASKS:
-1. Audit whether the plan satisfies every QUALITY RULE. Say agree=false and name the evidence gap if volume is missing/conflicted, H4/H1 are not aligned, or the entry/target is obstructed. You cannot override the deterministic WAIT gate.
+1. Audit the selected plan against every timeframe and volume measure provided. State concrete conflicts and missing evidence; do not override the locked direction or levels and do not turn a candidate into a WAIT.
 2. Give score_adjustment between -6 and +6.
 3. List up to 3 specific risk_flags (empty list if none).
 4. next_level_watch: the next key HTF level beyond TP2 and why price may approach it.
@@ -2648,6 +2648,17 @@ def build_telegram_signal_message(symbol, result):
     lines.append(f"💰 Entry: {_fmt(result.get('entry'), cfg)} | 🛑 SL: {_fmt(result.get('stop_loss'), cfg)} | {tp_txt}")
     lines.append(f"📐 R:R {result.get('rr_ratio')} | ⏳ Valid ~{result.get('expiry_hours', 18)}h (cancel if HTF bias flips)")
     lines.append(f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}")
+    lines.append(f"🎚️ Confidence: {_escape_telegram_html(result.get('confidence', 'n/a'))} | confluence score {result.get('confluence_score', 0)}/100")
+    volume = result.get('volume_confirmation') or {}
+    lines.append(
+        f"📊 Volume proxy: {_escape_telegram_html(volume.get('volume_pressure', 'UNAVAILABLE'))} | "
+        f"net {_escape_telegram_html(volume.get('net_volume_proxy_pct', 'n/a'))}% | "
+        f"buy/sell {_escape_telegram_html(volume.get('buy_volume_proxy_pct', 'n/a'))}%/"
+        f"{_escape_telegram_html(volume.get('sell_volume_proxy_pct', 'n/a'))}%"
+    )
+    warnings = result.get('quality_warnings') or []
+    if warnings:
+        lines.append("⚠️ <b>Quality risks:</b> " + _escape_telegram_html('; '.join(warnings[:3])))
     if result.get('risk_flags'):
         lines.append("⚠️ " + _escape_telegram_html('; '.join(str(x) for x in result['risk_flags'][:3])))
     lines.append(f"🧠 {_escape_telegram_html(reasoning)}")
@@ -2658,46 +2669,6 @@ def build_telegram_signal_message(symbol, result):
 # =============================================================================
 def _plan_side_ok(direction, entry, price, min_gap):
     return (price - entry) >= min_gap * 0.999 if direction == 'BUY' else (entry - price) >= min_gap * 0.999
-
-def no_trade_result(result, reason):
-    """Keep watch-only entry candidates visible without presenting a trade signal."""
-    candidates = result.get('entry_candidates') or []
-    if not candidates and result.get('entry') is not None:
-        zone = result.get('zone') or {}
-        volume = result.get('volume_confirmation') or {}
-        candidates = build_entry_watchlist({
-            'source': result.get('levels_source'),
-            'entry': result.get('entry'),
-            'zone': {
-                **zone,
-                'kind': zone.get('kind', 'Fallback entry area'),
-                'tf': zone.get('tf', 'H1'),
-                'bottom': zone.get('bottom', result.get('entry')),
-                'top': zone.get('top', result.get('entry')),
-            },
-            'volume_confirmation': volume,
-        }, result.get('candidates'), result.get('signal', 'WAIT'), {'digits': 5})
-    primary = candidates[0] if candidates else {}
-    result.update({
-        'candidate_direction': result.get('signal'),
-        'signal': 'WAIT',
-        'confidence': 'LOW',
-        'grade': 'NO TRADE',
-        'plan_state': 'WAIT',
-        'plan_status': 'NOT_CREATED',
-        'no_trade_reason': reason,
-        'suggested_entry': primary.get('entry', result.get('entry')),
-        'suggested_zone': primary or result.get('zone'),
-        'entry_candidates': candidates,
-        'entry': None,
-        'stop_loss': None,
-        'take_profit': [],
-        'rr_ratio': None,
-        'order_type': None,
-        'order_description': None,
-        'invalidation': None,
-    })
-    return result
 
 def detect_market_closed(symbol, df):
     """Non-crypto symbols close on weekends/holidays; a plan is still built, but not pushed."""
@@ -2717,7 +2688,7 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
     ai_used = bool(ai and ai.get('api_status') in ('SUCCESS', 'SUCCESS_EXTRACTED'))
     notes = []
     if plan.get('source') == 'ATR_FALLBACK':
-        notes.append('No valid HTF zone was within reach, so this is a low-conviction ATR pullback plan (capped at 60 and not pushed to Telegram).')
+        notes.append('No valid HTF zone was within reach; this is an ATR fallback plan with lower structural confidence.')
     notes.extend(bias['notes'])
     notes.extend(plan.get('candle_notes') or [])
     ai_text = ''
@@ -2765,6 +2736,9 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         'tp1_structural': plan.get('tp1_structural'), 'tp2_structural': plan.get('tp2_structural'),
         'sl_anchor': plan['sl_anchor'], 'tp1_kind': plan['tp1_kind'], 'tp2_kind': plan['tp2_kind'], 'ltf_refs': plan.get('ltf_refs', []),
         'python_validation_notes': notes, 'risk_flags': risk_flags, 'market_closed': market_closed,
+        'quality_warnings': signal_quality_warnings({
+            **plan, 'python_score': plan.get('score'), 'score': score
+        }, bias),
         'regime': (regime or {}).get('regime'), 'atr': atr_h1, 'live_price': live_price,
         'dxy_summary': dxy.get('detail'), 'ai_used': ai_used,
         'volume_analysis': ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {},
@@ -2858,13 +2832,6 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
         direction = bias['direction']
         dxy_rel = dxy_relation(symbol, direction, dxy)
 
-        if existing and existing.get('status') == 'PENDING' and int(existing.get('score') or 0) < MINIMUM_CONFLUENCE_SCORE:
-            existing['cancel_reason'] = f"plan score is below the new high-confidence threshold ({MINIMUM_CONFLUENCE_SCORE})"
-            cancelled = []
-            _close_plan(existing, 'CANCELLED', utc_now().isoformat(), cancelled)
-            if cancelled:
-                push_plan_events(symbol, existing, cancelled)
-
         live_existing = existing if (existing and existing.get('status') in LIVE_PLAN_STATUSES) else None
         plan_state = 'NEW'
         if live_existing and not force_new:
@@ -2923,26 +2890,13 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                         }
                 result['volume_analysis'] = ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {}
                 result['volume_context_is_advisory'] = True
-            if live_existing.get('status') == 'PENDING' and label != 'OPEN_TRADE_CONFLICT':
-                stored_plan = result.get('python_score') or result.get('confluence_score') or live_existing.get('score', 0)
-                rejection_reason = signal_quality_rejection({
-                    'source': result.get('levels_source'),
-                    'score': result.get('confluence_score') or live_existing.get('score', 0),
-                    'python_score': stored_plan,
-                    'tp1_structural': result.get('tp1_structural'),
-                    'volume_confirmation': result.get('volume_confirmation'),
-                }, bias)
-                if rejection_reason:
-                    live_existing['cancel_reason'] = rejection_reason
-                    cancelled = []
-                    _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), cancelled)
-                    if cancelled:
-                        push_plan_events(symbol, live_existing, cancelled)
-                    result = no_trade_result(result, rejection_reason)
-                    result['events'] = events + cancelled
-                    result['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    save_state()
-                    return result
+            result['quality_warnings'] = signal_quality_warnings({
+                'source': result.get('levels_source'),
+                'score': result.get('confluence_score') or live_existing.get('score', 0),
+                'python_score': result.get('python_score') or result.get('confluence_score') or live_existing.get('score', 0),
+                'tp1_structural': result.get('tp1_structural'),
+                'volume_confirmation': result.get('volume_confirmation'),
+            }, bias)
             if label == 'OPEN_TRADE_CONFLICT':
                 result.setdefault('python_validation_notes', [])
                 msg = f"HTF bias is now {direction} but the {live_existing['direction']} trade is already FILLED and open — manage it (SL/TP unchanged). A new plan will be built after it closes."
@@ -2963,12 +2917,6 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
 
         # ── 4. Build the best HTF-anchored limit plan ────────────────────────────────
         plan, audit = select_best_plan(direction, current_price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime)
-        if plan_state == 'PROVISIONAL':
-            # An unsent (low-conviction) plan is only replaced if the fresh candidate would actually
-            # clear the send threshold — otherwise keep the old plan so levels don't drift run to run.
-            thr = int(st.session_state.get('min_send_score', MINIMUM_CONFLUENCE_SCORE))
-            if plan['score'] < thr or plan.get('source') == 'ATR_FALLBACK':
-                return _reuse_result('REUSED')
 
         # ── 5. AI auditor (cannot change direction/levels) ───────────────────────────
         ai = None
@@ -2988,17 +2936,9 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 else:
                     current_price = new_price
         result = _finalize_result(symbol, plan, bias, audit, cfg, current_price, ai, dxy, dxy_rel, snaps, regime, market_closed, atr_h1)
-        rejection_reason = signal_quality_rejection({
+        result['quality_warnings'] = signal_quality_warnings({
             **plan, 'python_score': plan.get('score'), 'score': result['confluence_score']
         }, bias)
-        if rejection_reason:
-            if live_existing and live_existing.get('status') == 'PENDING':
-                live_existing['cancel_reason'] = rejection_reason
-                cancelled = []
-                _close_plan(live_existing, 'CANCELLED', utc_now().isoformat(), cancelled)
-                if cancelled:
-                    push_plan_events(symbol, live_existing, cancelled)
-            return no_trade_result(result, rejection_reason)
         result['plan_state'] = 'REPLANNED' if plan_state == 'PROVISIONAL' else 'NEW'
         result['plan_status'] = 'PENDING'
         result['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -3031,20 +2971,11 @@ def should_send_to_telegram(result):
         return False, 'existing plan unchanged - no new signal to push'
     if result.get('market_closed'):
         return False, 'market appears closed - plan stored but not pushed'
-    rejection = signal_quality_rejection({
-        'source': result.get('levels_source'),
-        'score': result.get('confluence_score'),
-        'python_score': result.get('python_score'),
-        'tp1_structural': result.get('tp1_structural'),
-        'volume_confirmation': result.get('volume_confirmation'),
-    }, result.get('htf_bias') or {})
-    if rejection:
-        return False, rejection
-    if result.get('confidence') != 'HIGH':
-        return False, 'signal did not pass the high-confidence gate'
-    threshold = max(MINIMUM_CONFLUENCE_SCORE, int(st.session_state.get('min_send_score', MINIMUM_CONFLUENCE_SCORE)))
-    if result.get('confluence_score', 0) < threshold:
-        return False, f"score {result.get('confluence_score', 0)} is below the {threshold} send threshold"
+    if result.get('signal') not in ('BUY', 'SELL'):
+        return False, 'no directional plan is available'
+    valid, reason = validate_signal_math(result, pair_config=get_pair_config(result.get('symbol', 'XAUUSD')))
+    if not valid:
+        return False, f"plan failed the execution-math check: {reason}"
     return True, ''
 
 # =============================================================================
@@ -3164,7 +3095,7 @@ def render_signal_card(symbol, result, all_data):
         return
     icon = '🟢' if sig == 'BUY' else '🔴'
     state = result.get('plan_state', 'NEW')
-    st.markdown(f"### {icon} {symbol} — {sig} LIMIT · Grade {result.get('grade', '-')} ({result.get('confluence_score', 0)}/100)")
+    st.markdown(f"### {icon} {symbol} — {sig} LIMIT · {result.get('confidence', 'n/a')} confidence · Grade {result.get('grade', '-')} ({result.get('confluence_score', 0)}/100)")
     st.caption(f"{STATE_LABELS.get(state, state)} · plan status: {result.get('plan_status', 'PENDING')} · live price {_fmt(result.get('live_price'), cfg)}")
     if state == 'REUSED':
         st.info("This plan was created earlier and is still valid (not filled, not invalidated, HTF bias unchanged). "
@@ -3187,6 +3118,8 @@ def render_signal_card(symbol, result, all_data):
         conf = f" — confluence: {', '.join(zone['confluence'])}" if zone.get('confluence') else ''
         st.write(f"**📍 Entry zone:** {zone.get('kind')} {_fmt(zone.get('bottom'), cfg)}–{_fmt(zone.get('top'), cfg)}{conf}")
     st.write(f"**Stop anchor:** {result.get('sl_anchor')} · **TP1:** {result.get('tp1_kind')} · **TP2:** {result.get('tp2_kind')}")
+    if result.get('quality_warnings'):
+        st.warning('⚠️ Setup quality: ' + '; '.join(result['quality_warnings']))
     st.write(f"**DXY correlation:** {result.get('dxy_correlation', 'N/A')} · **Regime (H1):** {result.get('regime', 'n/a')} · **Microstructure:** {result.get('microstructure_read', 'N/A')}")
     with st.expander('📊 Volume profile & pressure evidence'):
         volume_by_tf = result.get('volume_analysis_by_tf') or {}
@@ -3471,16 +3404,16 @@ with tab5:
         f"2. **Hysteresis.** A standing bias only flips with a score beyond ±{BIAS_FLIP_THRESHOLD:.0f}, an opposing H1/H4 close-based structure break, and at least {BIAS_MIN_HOLD_HOURS:.0f}h since it was set.\n"
         "3. **Entry = best HTF zone.** Unmitigated H4/H1 order blocks, open FVGs, 62–79% OTE, live swings, equal highs/lows, prior-period levels and estimated OHLCV volume-POC retests are ranked; M30/M15 then refine the limit *inside* the zone.\n"
         "4. **SL/TP are structural.** SL beyond the zone's distal edge (and any live swing just beyond) with an H1-ATR buffer; TP1/TP2 are the next opposing HTF levels that pay at least 1.5R.\n"
-        f"5. **Confidence gate.** Publish only scores >= {MINIMUM_CONFLUENCE_SCORE} with aligned H4/H1, a structural TP1 and directional volume pressure from at least {MINIMUM_ALIGNED_VOLUME_INTERVALS} distinct bar intervals; otherwise return WAIT.\n"
-        "6. **Plan lock.** One qualifying plan per symbol is created and managed until it resolves — reruns return the same plan.\n"
+        "5. **Best executable candidate.** Evaluate all available ranked H4/H1 zones, then publish the highest composite-score calculable plan even when volume or timeframe evidence conflicts; conflicts lower its confidence and appear as warnings rather than suppressing the entry. This score is not a calibrated probability.\n"
+        "6. **Plan lock.** One plan per symbol is created and managed until it resolves — reruns return the same plan.\n"
         "7. **AI is an auditor.** It cannot change direction or levels; it flags risks, reads screenshots and adjusts the score by ±6. Scores are rule-based confluence, not calibrated win probabilities."
     )
     st.markdown(f"- **AI model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
     st.markdown("- **Execution:** resting LIMIT orders only · manual trigger only (no auto-loop)")
     st.markdown(f"- **State file:** `{STATE_PATH}` (set `DERAI_STATE_PATH` to change it; on Streamlit Community Cloud the disk resets when the app is rebuilt/restarted)")
     st.markdown("---")
-    st.subheader("Telegram & scoring controls")
-    st.slider("Minimum score to push a high-confidence signal to Telegram", MINIMUM_CONFLUENCE_SCORE, 90, MINIMUM_CONFLUENCE_SCORE, key="min_send_score")
+    st.subheader("Telegram & scoring")
+    st.caption("All new BUY/SELL plans that pass the execution-math check can be sent, regardless of score; review the confidence grade and quality warnings before acting.")
     st.checkbox("Send plan events (filled / TP / SL / cancelled / missed / expired) to Telegram", value=True, key="notify_plan_events")
     if st.button("🧹 Reset stored bias, plans and ledger"):
         reset_state()
