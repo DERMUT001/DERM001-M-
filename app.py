@@ -21,9 +21,9 @@
 #   * The limit entry is chosen from ranked HTF zones (H4/H1 OB, FVG, OTE, swings, liquidity),
 #     then refined by M30/M15 structure INSIDE the zone. SL/TP are structural (TP1/TP2 = next
 #     opposing HTF levels paying >= 1.5R).
-#   * PLAN LOCK: one plan per symbol is created and managed (pending/filled/TP/SL/missed/expired/
-#     stale/cancelled) — re-running returns the same plan; it is replaced only when it resolves
-#     or the HTF bias genuinely flips. Results are tracked in a ledger with win rate and net R.
+#   * PLAN LOCK: one plan per symbol is created and managed — re-running returns the same levels;
+#     pending plans remain locked until resolved, their H1 zone is invalidated, or HTF bias flips.
+#     Results are tracked in a ledger with win rate and net R.
 #   * The AI is now an AUDITOR: it cannot change direction or levels; it flags risks, reads chart
 #     screenshots and adjusts the transparent 100-point Python score by at most +/-6.
 #   * Keeps everything from V2: Groq model order, per-model token budgets, Telegram, LIMIT-only.
@@ -1125,7 +1125,7 @@ def to_jsonable(obj):
     return obj
 
 def _default_state():
-    return {'version': 3, 'bias': {}, 'plans': {}, 'ledger': []}
+    return {'version': 4, 'bias': {}, 'plans': {}, 'ledger': []}
 
 def load_state(force=False):
     """Session cache first; `force=True` re-reads the file (used at the start of every run so
@@ -1143,6 +1143,34 @@ def load_state(force=False):
                 for key in fresh:
                     if isinstance(loaded.get(key), type(fresh[key])):
                         fresh[key] = loaded[key]
+                fresh['version'] = 4
+                for symbol, plan in fresh['plans'].items():
+                    if plan.get('status') == 'PENDING':
+                        result = plan.get('result')
+                        if isinstance(result, dict) and result.get('levels_source') == 'ATR_FALLBACK':
+                            closed_at = utc_now().isoformat()
+                            plan.update({
+                                'status': 'CANCELLED', 'outcome': 'CANCELLED',
+                                'closed_at': closed_at,
+                                'cancel_reason': 'Legacy ATR-only setup retired; executable plans now require a validated HTF zone.',
+                                'r_multiple': 0.0,
+                            })
+                            result['plan_status'] = 'CANCELLED'
+                            fresh['ledger'].append({
+                                'symbol': symbol, 'direction': plan.get('direction'), 'entry': plan.get('entry'),
+                                'stop_loss': plan.get('stop_loss'),
+                                'tp1': (plan.get('take_profit') or [None])[0], 'rr': plan.get('rr_ratio'),
+                                'score': plan.get('score'), 'grade': plan.get('grade'),
+                                'created_at': plan.get('created_at'), 'closed_at': closed_at,
+                                'outcome': 'CANCELLED', 'r': 0.0,
+                                'zone': (plan.get('zone') or {}).get('kind'),
+                            })
+                            continue
+                        plan['expiry_hours'] = None
+                        if isinstance(result, dict):
+                            result['expiry_hours'] = None
+                            result['order_expiry'] = 'until the entry zone is invalidated or an opposing HTF bias flip is confirmed'
+                fresh['ledger'] = fresh['ledger'][-MAX_LEDGER:]
                 state = fresh
     except Exception as exc:
         print(f"⚠️ State load failed ({STATE_PATH}): {exc}")
@@ -1642,16 +1670,23 @@ def _zigzag(pivots, min_leg):
     return out
 
 def _mark_swept(d, pivots):
-    """A pivot high that later price has traded above is no longer live liquidity/resistance
-    (same for lows). Only un-swept pivots are valid SL anchors or TP targets."""
+    """Track the first later trade through each pivot and whether that candle reclaimed it."""
     highs = d['High'].to_numpy(dtype=float)
     lows = d['Low'].to_numpy(dtype=float)
+    closes = d['Close'].to_numpy(dtype=float)
     for p in pivots:
-        after = slice(p['i'] + 1, len(d))
+        after = p['i'] + 1
         if p['type'] == 'H':
-            p['swept'] = bool(len(highs[after]) and highs[after].max() > p['price'])
+            hits = np.flatnonzero(highs[after:] > p['price'])
+            reclaimed = lambda index: closes[index] < p['price']
         else:
-            p['swept'] = bool(len(lows[after]) and lows[after].min() < p['price'])
+            hits = np.flatnonzero(lows[after:] < p['price'])
+            reclaimed = lambda index: closes[index] > p['price']
+        p['swept'] = bool(len(hits))
+        if p['swept']:
+            sweep_index = after + int(hits[0])
+            p['swept_at'] = d.index[sweep_index]
+            p['sweep_reclaimed'] = bool(reclaimed(sweep_index))
     return pivots
 
 def classify_structure(pivots):
@@ -1841,6 +1876,58 @@ def find_liquidity_pools(pivots, atr, tol_atr=0.2, max_pivots=10):
                 result[key].append({'level': max(prices) if ptype == 'H' else min(prices), 'count': len(group)})
     return result
 
+def summarize_liquidity_context(snaps, levels, price):
+    """Summarize observed sweeps and nearby unswept liquidity without implying order-book data."""
+    sweeps, above, below = [], [], []
+
+    def add_pool(collection, kind, timeframe, level, count=1):
+        level = float(level)
+        collection.append({
+            'kind': kind, 'timeframe': timeframe, 'level': level,
+            'distance': round(abs(level - float(price)), 6), 'count': int(count),
+        })
+
+    for timeframe in ('H4', 'H1'):
+        snap = snaps.get(timeframe)
+        if not snap:
+            continue
+        for pivot in snap.get('pivots') or []:
+            collection = above if pivot['type'] == 'H' else below
+            if pivot.get('swept'):
+                age_bars = len(snap.get('df', [])) - int(pivot.get('i', 0))
+                if age_bars <= 20:
+                    sweeps.append({
+                        'timeframe': timeframe,
+                        'side': 'buy-side' if pivot['type'] == 'H' else 'sell-side',
+                        'level': float(pivot['price']),
+                        'time': pivot.get('swept_at'),
+                        'reclaimed': bool(pivot.get('sweep_reclaimed')),
+                    })
+            elif (pivot['type'] == 'H' and pivot['price'] > price) or (pivot['type'] == 'L' and pivot['price'] < price):
+                add_pool(collection, 'swing high' if pivot['type'] == 'H' else 'swing low',
+                         timeframe, pivot['price'])
+        for pool in (snap.get('liquidity') or {}).get('eqh') or []:
+            if pool['level'] > price:
+                add_pool(above, 'equal highs', timeframe, pool['level'], pool['count'])
+        for pool in (snap.get('liquidity') or {}).get('eql') or []:
+            if pool['level'] < price:
+                add_pool(below, 'equal lows', timeframe, pool['level'], pool['count'])
+
+    for name in ('PDH', 'PWH'):
+        if levels.get(name) is not None and levels[name] > price:
+            add_pool(above, name, 'prior period', levels[name])
+    for name in ('PDL', 'PWL'):
+        if levels.get(name) is not None and levels[name] < price:
+            add_pool(below, name, 'prior period', levels[name])
+
+    sweeps.sort(
+        key=lambda item: parse_ts(item.get('time')).value if parse_ts(item.get('time')) is not None else -1,
+        reverse=True,
+    )
+    above.sort(key=lambda item: item['distance'])
+    below.sort(key=lambda item: item['distance'])
+    return {'recent_sweeps': sweeps[:8], 'potential_above': above[:8], 'potential_below': below[:8]}
+
 def dealing_range(d, pivots, atr):
     highs = [p['price'] for p in pivots if p['type'] == 'H'][-2:]
     lows = [p['price'] for p in pivots if p['type'] == 'L'][-2:]
@@ -2024,9 +2111,9 @@ def get_pair_config(symbol):
         'htf_min_gap_atr': 0.15, 'htf_max_gap_atr': 3.0, 'htf_max_gap_pct': 0.012,
         'min_stop_atr': 0.8, 'max_stop_atr': 3.0, 'max_risk_pct': 0.012,
         'stop_buffer_atr': 0.30, 'tp_buffer_atr': 0.15,
-        'plan_expiry_hours': 18,
+        'plan_expiry_hours': None,
         'ob_disp_atr': 1.0, 'fvg_min_atr': 0.25, 'liq_tol_atr': 0.2,
-        'default_pullback_atr': 0.6, 'min_dist_pct': 0.0015,
+        'min_dist_pct': 0.0015,
         'score_floor': MINIMUM_CONFLUENCE_SCORE,
     }
     overrides = {
@@ -2043,13 +2130,6 @@ def htf_entry_gap_bounds(price, atr_h1, cfg):
     if max_gap <= min_gap:
         max_gap = min_gap * 3.0
     return min_gap, max_gap
-
-def compute_fallback_atr_plan_levels(direction, price, atr_h1, cfg):
-    """Only used when NO structural plan is valid. Always low-scored, never pushed to Telegram."""
-    min_gap, max_gap = htf_entry_gap_bounds(price, atr_h1, cfg)
-    gap = min(max(atr_h1 * float(cfg['default_pullback_atr']), min_gap), max_gap)
-    entry = price - gap if direction == 'BUY' else price + gap
-    return entry
 
 # =============================================================================
 # ── V3 CORE: HTF BIAS (H4 + H1 ONLY) WITH PERSISTENT HYSTERESIS ─────────────
@@ -2226,10 +2306,6 @@ def collect_entry_zones(direction, snaps, levels, atr_h1, cfg):
         live = [p for p in snap['pivots'] if p['type'] == want_type and not p.get('swept')][-3:]
         for p in live:
             zones.append(_zone(f"{label} swing {'low' if buy else 'high'}", label, p['price'] + 0.15 * atr_h1, p['price'] - 0.15 * atr_h1, tfw * 0.5, 0))
-        pool_key = 'eql' if buy else 'eqh'
-        for pool in snap['liquidity'][pool_key][-2:]:
-            zones.append(_zone(f"{label} equal {'lows' if buy else 'highs'} x{pool['count']}", label,
-                               pool['level'] + 0.10 * atr_h1, pool['level'] - 0.25 * atr_h1, tfw * 0.5 + 0.4 * pool['count'], 0))
     for key, w in (('PDL' if buy else 'PDH', 1.0), ('PWL' if buy else 'PWH', 1.3)):
         if key in levels:
             zones.append(_zone(f"{key} liquidity", 'H1', levels[key] + 0.10 * atr_h1, levels[key] - 0.25 * atr_h1, w, 0))
@@ -2522,7 +2598,7 @@ def signal_quality_warnings(plan, bias, minimum_score=MINIMUM_CONFLUENCE_SCORE):
     if bias.get('low_conviction') or not bias.get('aligned'):
         warnings.append('H4 and H1 are not fully aligned; directional bias is lower conviction')
     if plan.get('source') != 'HTF_STRUCTURE':
-        warnings.append('No ranked higher-timeframe entry zone was in reach; using the ATR fallback')
+        warnings.append('Plan is not anchored to a ranked higher-timeframe zone')
     if not plan.get('tp1_structural'):
         warnings.append('TP1 is an R-multiple projection rather than a structural target')
     python_score = int(plan.get('python_score', plan.get('score', 0)) or 0)
@@ -2589,25 +2665,7 @@ def select_best_plan(direction, price, snaps, levels, atr_h1, cfg, bias, dxy_rel
         )
         best['source'] = 'HTF_STRUCTURE'
         return best, audit
-    entry = compute_fallback_atr_plan_levels(direction, price, atr_h1, cfg)
-    fake_zone = _zone('ATR pullback (no valid HTF zone in reach)', 'H1', entry + 0.2 * atr_h1, entry - 0.2 * atr_h1, 0.0, 0)
-    fake_zone['zone_score'] = 0.0
-    plan, reason = build_plan_for_entry(direction, entry, fake_zone, snaps, levels, atr_h1, cfg)
-    if plan is None:
-        risk = max(entry * float(cfg['min_dist_pct']), atr_h1 * float(cfg['min_stop_atr']))
-        sl = entry - risk if direction == 'BUY' else entry + risk
-        tp = entry + risk * 1.7 if direction == 'BUY' else entry - risk * 1.7
-        plan = {'direction': direction, 'entry': round_price(entry, cfg), 'stop_loss': round_price(sl, cfg),
-                'take_profit': [round_price(tp, cfg), round_price(entry + risk * 3 if direction == 'BUY' else entry - risk * 3, cfg)],
-                'rr_ratio': 1.7, 'risk': float(risk), 'sl_anchor': 'ATR stop', 'tp1_kind': 'R-multiple projection',
-                'tp2_kind': 'R-multiple projection', 'tp1_structural': False, 'tp2_structural': False, 'ltf_refs': [], 'order_type': 'LIMIT'}
-    plan['zone'] = {'kind': fake_zone['kind'], 'tf': 'H1', 'top': fake_zone['top'], 'bottom': fake_zone['bottom'],
-                    'touches': 0, 'confluence': [], 'zone_score': 0.0}
-    score, breakdown, candle_notes, volume_evidence = score_plan(direction, plan, fake_zone, bias, snaps, dxy_rel, regime, ltf_snaps, price, atr_h1)
-    plan['score'], plan['score_breakdown'], plan['candle_notes'] = min(score, 60), breakdown, candle_notes
-    plan['volume_confirmation'] = volume_evidence
-    plan['source'] = 'ATR_FALLBACK'
-    return plan, audit
+    return None, audit
 
 def build_entry_watchlist(plan, audit, direction, cfg, limit=10):
     """Keep alternative entry locations visible alongside the selected executable plan."""
@@ -2673,8 +2731,8 @@ def build_entry_watchlist(plan, audit, direction, cfg, limit=10):
 
 # =============================================================================
 # ── V3 CORE: PLAN LIFECYCLE & PLAN LOCK ─────────────────────────────────────
-# A plan is created ONCE and then managed until it fills+resolves, is missed, expires, goes
-# stale, or the HTF bias genuinely flips. Re-running the analysis returns the SAME plan instead
+# A plan is created ONCE and then managed until it fills+resolves, is missed, its pending zone is
+# invalidated, or the HTF bias genuinely flips. Re-running the analysis returns the SAME plan instead
 # of inventing a new one — this is what ends the "BUY now, SELL 30 minutes later" behaviour.
 # =============================================================================
 def _close_plan(plan, outcome, ts, events, ledger=True):
@@ -2743,11 +2801,37 @@ def evaluate_plan_lifecycle(plan, price_df, live_price=None, now=None):
             if tp_hit:
                 _close_plan(plan, 'TP_HIT', ts, events)
                 break
-    if plan.get('status') == 'PENDING':
+    expiry_hours = plan.get('expiry_hours')
+    if plan.get('status') == 'PENDING' and expiry_hours is not None:
         age_h = (now - created).total_seconds() / 3600.0
-        if age_h > float(plan.get('expiry_hours', 18)):
+        if age_h > float(expiry_hours):
             _close_plan(plan, 'EXPIRED', now.isoformat(), events)
     return events
+
+def pending_plan_invalidation_reason(plan, h1_df):
+    """A pending zone is invalid only after a fully closed H1 candle settles through its far edge."""
+    if not plan or plan.get('status') != 'PENDING' or h1_df is None or h1_df.empty:
+        return None
+    zone = plan.get('zone') or {}
+    if zone.get('bottom') is None or zone.get('top') is None:
+        return None
+    created = parse_ts(plan.get('created_at'))
+    if created is None:
+        return None
+    candles = closed_candles(h1_df)
+    if candles is None or candles.empty:
+        return None
+    bar_minutes = infer_bar_minutes(candles) or 60
+    for ts, row in candles.iterrows():
+        opened_at = parse_ts(ts)
+        if opened_at is None or opened_at + pd.Timedelta(minutes=bar_minutes) <= created:
+            continue
+        close = float(row['Close'])
+        if plan.get('direction') == 'BUY' and close < float(zone['bottom']):
+            return f"H1 closed below the locked demand zone at {zone['bottom']}."
+        if plan.get('direction') == 'SELL' and close > float(zone['top']):
+            return f"H1 closed above the locked supply zone at {zone['top']}."
+    return None
 
 def existing_plan_action(plan, direction, force_new=False, bias_flip_confirmed=False):
     """Keep pending plans stable until an explicit override or confirmed HTF bias flip."""
@@ -2861,6 +2945,7 @@ def build_plan_reasoning(symbol, plan, bias, cfg, live_price):
     side = plan['direction']
     tps = plan['take_profit']
     move = 'sell-off' if side == 'SELL' else 'rally'
+    invalidation_edge = z['top'] if side == 'SELL' else z['bottom']
     bias_txt = f"HTF bias is {bias['word']} (score {bias['score']:+.0f}; H4 {bias['h4_score']:+.0f}, H1 {bias['h1_score']:+.0f}; {'H4 and H1 aligned' if bias['aligned'] else 'H4/H1 not fully aligned'})"
     if bias['held']:
         bias_txt += ' - standing bias retained'
@@ -2870,7 +2955,7 @@ def build_plan_reasoning(symbol, plan, bias, cfg, live_price):
         f"{bias_txt}. At {_fmt(live_price, cfg)}, the {z['kind']} ({_fmt(z['bottom'], cfg)}-{_fmt(z['top'], cfg)}{conf}) is a candidate re-entry area if price pulls back before the {move}."
         f"{ltf} Entry {_fmt(plan['entry'], cfg)}; SL {_fmt(plan['stop_loss'], cfg)} beyond {plan['sl_anchor']}; "
         f"TP1 {_fmt(tps[0], cfg)} ({plan['tp1_kind']}, {plan['rr_ratio']}R), TP2 {_fmt(tps[1], cfg)} ({plan['tp2_kind']}). "
-        f"Price may continue without retesting this area; do not chase. The idea is invalidated by an H1 close beyond {_fmt(plan['stop_loss'], cfg)} or an opposing H1/H4 structure break."
+        f"Price may continue without retesting this area; do not chase. Before entry, the limit idea is invalidated by an H1 close beyond the zone edge at {_fmt(invalidation_edge, cfg)} or a confirmed opposing H1/H4 structure break. After entry, the stop loss remains the trade invalidation."
     )
 
 def build_ai_audit_prompt(symbol, plan, bias, audit, snaps, cfg, live_price, dxy, dxy_rel, levels):
@@ -2988,7 +3073,7 @@ def build_telegram_signal_message(symbol, result):
     lines.append(f"🧾 Order: {_escape_telegram_html(result.get('order_type', 'LIMIT'))}")
     tp_txt = f"🎯 TP1: {tp1}" + (f" | TP2: {tp2}" if tp2 else '')
     lines.append(f"💰 Entry: {_fmt(result.get('entry'), cfg)} | 🛑 SL: {_fmt(result.get('stop_loss'), cfg)} | {tp_txt}")
-    lines.append(f"📐 R:R {result.get('rr_ratio')} | ⏳ Valid ~{result.get('expiry_hours', 18)}h (cancel if HTF bias flips)")
+    lines.append(f"📐 R:R {result.get('rr_ratio')} | ⏳ Valid until the entry zone is invalidated or an opposing HTF bias flip is confirmed")
     lines.append(f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}")
     lines.append(f"🎚️ Confidence: {_escape_telegram_html(result.get('confidence', 'n/a'))} | confluence score {result.get('confluence_score', 0)}/100")
     volume = result.get('volume_confirmation') or {}
@@ -3025,12 +3110,10 @@ def detect_market_closed(symbol, df):
     except Exception:
         return False
 
-def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_rel, snaps, regime, market_closed, atr_h1):
+def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_rel, snaps, levels, regime, market_closed, atr_h1):
     score = int(plan['score'])
     ai_used = bool(ai and ai.get('api_status') in ('SUCCESS', 'SUCCESS_EXTRACTED'))
     notes = []
-    if plan.get('source') == 'ATR_FALLBACK':
-        notes.append('No valid HTF zone was within reach; this is an ATR fallback plan with lower structural confidence.')
     notes.extend(bias['notes'])
     notes.extend(plan.get('candle_notes') or [])
     ai_text = ''
@@ -3045,8 +3128,6 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
             adj = min(adj, -4)
             notes.append('AI auditor DISAGREED with the plan (direction and levels unchanged; conviction reduced).')
         score = max(0, min(100, score + adj))
-        if plan.get('source') == 'ATR_FALLBACK':
-            score = min(score, 60)
         ai_text = str(ai.get('reasoning') or '').strip()
         risk_flags = [str(x) for x in (ai.get('risk_flags') or []) if x][:3]
     py_reason = build_plan_reasoning(symbol, plan, bias, cfg, live_price)
@@ -3068,10 +3149,11 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         'dxy_correlation': dxy_rel, 'reasoning': reasoning, 'python_reasoning': py_reason,
         'entry': plan['entry'], 'stop_loss': plan['stop_loss'], 'take_profit': plan['take_profit'],
         'rr_ratio': plan['rr_ratio'], 'order_type': 'LIMIT', 'exhaustion_target': plan['take_profit'][0],
-        'expiry_hours': cfg['plan_expiry_hours'], 'order_expiry': f"~{cfg['plan_expiry_hours']}h or until the HTF bias flips",
-        'invalidation': f"H1 close beyond {_fmt(plan['stop_loss'], cfg)} or an opposing H1/H4 structure break",
+        'expiry_hours': cfg['plan_expiry_hours'],
+        'order_expiry': 'until the entry zone is invalidated or an opposing HTF bias flip is confirmed',
+        'invalidation': f"H1 close beyond the {plan['direction'].lower()} zone edge or a confirmed opposing H1/H4 structure break",
         'order_description': (f"{plan['direction']} LIMIT {_fmt(plan['entry'], cfg)} | SL {_fmt(plan['stop_loss'], cfg)} | "
-                              f"TP1 {_fmt(plan['take_profit'][0], cfg)} | TP2 {_fmt(plan['take_profit'][1], cfg)} | valid ~{cfg['plan_expiry_hours']}h."),
+                              f"TP1 {_fmt(plan['take_profit'][0], cfg)} | TP2 {_fmt(plan['take_profit'][1], cfg)} | valid until structural invalidation."),
         'zone': plan['zone'], 'htf_bias': bias, 'score_breakdown': plan['score_breakdown'],
         'python_score': int(plan['score']), 'candidates': audit[:6], 'levels_source': plan.get('source', 'HTF_STRUCTURE'),
         'entry_candidates': build_entry_watchlist(plan, audit, plan['direction'], cfg),
@@ -3086,6 +3168,7 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         'volume_analysis': ((snaps.get('H1') or {}).get('micro') or {}).get('volume_analysis') or {},
         'volume_analysis_by_tf': volume_analysis_by_tf,
         'volume_confirmation': plan.get('volume_confirmation') or {},
+        'liquidity_context': summarize_liquidity_context(snaps, levels, live_price),
         'microstructure_read': (ai.get('microstructure_read') if ai_used and ai.get('microstructure_read') else
                                 'VWAP {} | RVOL {} | momentum {} | last candle {}'.format(
                                     *[(snaps.get('_micro_m10') or {}).get(k, 'n/a') for k in ('price_vs_vwap', 'rvol', 'momentum')],
@@ -3106,6 +3189,27 @@ def _finalize_result(symbol, plan, bias, audit, cfg, live_price, ai, dxy, dxy_re
         result['groq_failure'] = ai.get('rejection_reason')
         result['groq_api_status'] = ai.get('api_status')
     return result
+
+def build_wait_result(symbol, direction, price, audit, bias, snaps, levels, market_data, market_closed):
+    """Return watch-only zones when no valid structural limit plan is available."""
+    candidates = build_entry_watchlist(None, audit, direction, get_pair_config(symbol))
+    return {
+        'symbol': symbol, 'signal': 'WAIT', 'bias': bias.get('word'),
+        'confluence_score': 0, 'confidence': confidence_for(0), 'grade': grade_for(0),
+        'reasoning': 'No valid H1/H4 structural entry zone currently supports an executable limit setup. Do not substitute an ATR-only price; monitor the listed zones and liquidity levels for a confirmed reaction.',
+        'python_reasoning': 'No valid H1/H4 structural entry zone currently supports an executable limit setup.',
+        'no_trade_reason': 'No valid higher-timeframe structural zone is available at an acceptable distance with a valid structural stop and target.',
+        'live_price': price, 'entry_candidates': candidates,
+        'candidates': audit[:6], 'levels_source': 'NONE',
+        'htf_bias': bias, 'volume_confirmation': {},
+        'liquidity_context': summarize_liquidity_context(snaps, levels, price),
+        'market_data': dict(market_data), 'market_closed': market_closed,
+        'plan_state': 'WAIT', 'plan_status': 'NO_SETUP',
+        'model_used': 'Python structure engine (no executable plan)',
+        'api_status': 'ENGINE_ONLY', 'ai_used': False,
+        'quality_warnings': ['No structural setup passed plan validation'],
+        'risk_flags': [], 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    }
 
 def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='image/png', force_new=False, use_ai=True):
     try:
@@ -3185,6 +3289,10 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                                     lifecycle_m10[column], errors='coerce'
                                 ) + basis_delta
             events += evaluate_plan_lifecycle(existing, lifecycle_m10, live_price=current_price)
+            invalidation = pending_plan_invalidation_reason(existing, h1_raw)
+            if invalidation:
+                existing['cancel_reason'] = invalidation
+                _close_plan(existing, 'CANCELLED', utc_now().isoformat(), events)
         if events and existing:
             push_plan_events(symbol, existing, events)
 
@@ -3219,7 +3327,16 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
             result['market_data'] = dict(live_snapshot)
             result['htf_bias'] = bias
             result['analyzed_at_live'] = utc_now().isoformat()
+            result['expiry_hours'] = None
+            result['order_expiry'] = 'until the entry zone is invalidated or an opposing HTF bias flip is confirmed'
+            result['order_description'] = (
+                f"{live_existing['direction']} LIMIT {_fmt(live_existing['entry'], cfg)} | "
+                f"SL {_fmt(live_existing['stop_loss'], cfg)} | "
+                f"TP1 {_fmt((live_existing.get('take_profit') or [None])[0], cfg)} | "
+                f"valid until structural invalidation."
+            )
             result['gap_to_entry'] = round(abs(current_price - float(live_existing['entry'])), cfg['digits'])
+            result['liquidity_context'] = summarize_liquidity_context(snaps, levels, current_price)
             locked_zone = result.get('zone') or live_existing.get('zone') or {}
             if locked_zone.get('bottom') is not None and locked_zone.get('top') is not None:
                 result['selection_volume_confirmation'] = result.get('volume_confirmation') or {}
@@ -3278,6 +3395,12 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
 
         # ── 4. Build the best HTF-anchored limit plan ────────────────────────────────
         plan, audit = select_best_plan(direction, current_price, snaps, levels, atr_h1, cfg, bias, dxy_rel, regime)
+        if plan is None:
+            result = build_wait_result(symbol, direction, current_price, audit, bias, snaps, levels, live_snapshot, market_closed)
+            result['events'] = events
+            if not save_state():
+                return {'error': 'The analysis found no structural setup, but updated plan state could not be saved.'}
+            return result
 
         # ── 5. AI auditor (cannot change direction/levels) ───────────────────────────
         ai = None
@@ -3342,11 +3465,17 @@ def analyze_symbol_premium(symbol, all_data, image_b64=None, image_mime_type='im
                 previous_price = current_price
                 current_price = new_price
                 plan, audit = select_best_plan(direction, current_price, snaps, levels, atr_h1, cfg, bias, dxy_rel=dxy_rel, regime=regime)
+                if plan is None:
+                    result = build_wait_result(symbol, direction, current_price, audit, bias, snaps, levels, live_snapshot, market_closed)
+                    result['events'] = events
+                    if not save_state():
+                        return {'error': 'The final quote left no valid structural setup, and updated plan state could not be saved.'}
+                    return result
                 plan.setdefault('notes', []).append(
                     f"Rebuilt using the final live quote after price moved from {_fmt(previous_price, cfg)} to {_fmt(new_price, cfg)}."
                 )
                 ai = None
-        result = _finalize_result(symbol, plan, bias, audit, cfg, current_price, ai, dxy, dxy_rel, snaps, regime, market_closed, atr_h1)
+        result = _finalize_result(symbol, plan, bias, audit, cfg, current_price, ai, dxy, dxy_rel, snaps, levels, regime, market_closed, atr_h1)
         result['market_data'] = dict(live_snapshot)
         result['quality_warnings'] = signal_quality_warnings({
             **plan, 'python_score': plan.get('score'), 'score': result['confluence_score']
@@ -3563,12 +3692,41 @@ def render_market_data_provenance(result, cfg):
         else:
             st.info("XAUUSD uses keyless public feeds. The live reference is Gold-API XAU/USD; its candle history comes from Bitfinex XAUT/USD and is shifted only when a recent Bitfinex trade verifies the spot basis. Otherwise, candles remain unadjusted. This is not an exact spot-candle conversion and can differ from your broker's XAUUSD spot/CFD chart. Yahoo GC=F is a separate COMEX-futures cross-check.")
 
+def render_liquidity_context(result, cfg):
+    liquidity = result.get('liquidity_context') or {}
+    with st.expander('🧲 Liquidity pools & sweeps'):
+        sweeps = liquidity.get('recent_sweeps') or []
+        if sweeps:
+            st.write('**Recent sweeps:**')
+            st.dataframe(pd.DataFrame([{
+                'TF': item['timeframe'], 'Liquidity': item['side'],
+                'Level': _fmt(item['level'], cfg), 'Time': str(item.get('time') or 'n/a'),
+                'Close reclaimed level': 'Yes' if item.get('reclaimed') else 'No',
+            } for item in sweeps]), hide_index=True, use_container_width=True)
+        else:
+            st.caption('No confirmed pivot sweeps were identified in the available closed H1/H4 candles.')
+        pools_above = liquidity.get('potential_above') or []
+        pools_below = liquidity.get('potential_below') or []
+        pool_rows = [
+            {'Side': side, 'Pool': item['kind'], 'TF': item['timeframe'],
+             'Level': _fmt(item['level'], cfg), 'Distance': _fmt(item['distance'], cfg), 'Cluster count': item['count']}
+            for side, pools in (('Buy-side (above)', pools_above), ('Sell-side (below)', pools_below))
+            for item in pools
+        ]
+        if pool_rows:
+            st.write('**Potential liquidity targets (not confirmed resting orders):**')
+            st.dataframe(pd.DataFrame(pool_rows), hide_index=True, use_container_width=True)
+        else:
+            st.caption('No unswept swing or equal-high/low pools were found beyond the current price.')
+        st.caption("Volume is estimated from OHLCV candles; it cannot reveal actual bid/ask aggressor volume or verify institutional orders.")
+
 def render_signal_card(symbol, result, all_data):
     cfg = get_pair_config(symbol)
     sig = result.get('signal')
     if sig == 'WAIT':
         st.markdown(f"### ⏸️ {symbol} — WAIT · Entry watchlist")
         render_market_data_provenance(result, get_pair_config(symbol))
+        render_liquidity_context(result, cfg)
         st.info(f"**Trade filter:** {result.get('no_trade_reason', 'The candidate does not currently meet the high-confidence rules.')}")
         st.write(f"**Candidate score:** {result.get('confluence_score', 0)}/100 · **HTF bias:** {(result.get('htf_bias') or {}).get('word', 'n/a')} · **Volume evidence:** {(result.get('volume_confirmation') or {}).get('retest_assessment', 'n/a')}")
         entry_candidates = result.get('entry_candidates') or []
@@ -3606,7 +3764,7 @@ def render_signal_card(symbol, result, all_data):
         if result.get('plan_status') == 'FILLED':
             st.info("The existing trade is still open. Its entry, stop, and targets remain locked; a fresh-plan override cannot replace an open trade.")
         else:
-            st.info("This pending setup remains locked across analysis runs, even if it has not been sent. New candles or volume scores alone will not replace it; the lock ends when the setup resolves, expires, the HTF bias flips, or you explicitly override it.")
+            st.info("This pending setup remains locked across analysis runs, even if it has not been sent. New candles or volume scores alone will not replace it; the lock ends when the setup resolves, its H1 zone is structurally invalidated, a confirmed HTF bias flip occurs, or you explicitly override it.")
     if result.get('market_closed'):
         st.warning("Market appears closed for this symbol — the plan is stored but won't be pushed to Telegram.")
     tps = result.get('take_profit') or [None, None]
@@ -3624,6 +3782,7 @@ def render_signal_card(symbol, result, all_data):
     if zone:
         conf = f" — confluence: {', '.join(zone['confluence'])}" if zone.get('confluence') else ''
         st.write(f"**📍 Entry zone:** {zone.get('kind')} {_fmt(zone.get('bottom'), cfg)}–{_fmt(zone.get('top'), cfg)}{conf}")
+    render_liquidity_context(result, cfg)
     st.write(f"**Stop anchor:** {result.get('sl_anchor')} · **TP1:** {result.get('tp1_kind')} · **TP2:** {result.get('tp2_kind')}")
     if result.get('quality_warnings'):
         st.warning('⚠️ Setup quality: ' + '; '.join(result['quality_warnings']))
@@ -3824,7 +3983,7 @@ with tab2:
 
 with tab3:
     st.header("🧭 Plan Tracker")
-    st.caption("Every plan is created once and then tracked until it fills and resolves, is missed, expires, goes stale, or the HTF bias genuinely flips. State is saved to disk so it survives restarts of this session.")
+    st.caption("Each pending setup keeps fixed levels until it fills, reaches a target without entry, its H1 zone is invalidated, or the HTF bias genuinely flips. A new plan is not invented just because price approaches the locked entry. State is saved to disk.")
     tstate = load_state()
     rcol1, rcol2 = st.columns([1, 1])
     if rcol1.button("🔄 Refresh live plan statuses"):
@@ -3927,7 +4086,7 @@ with tab5:
         "3. **Entry = best HTF zone.** Unmitigated H4/H1 order blocks, open FVGs, 62–79% OTE, live swings, equal highs/lows, prior-period levels and estimated OHLCV volume-POC retests are ranked; M30/M15 then refine the limit *inside* the zone.\n"
         "4. **SL/TP are structural.** SL beyond the zone's distal edge (and any live swing just beyond) with an H1-ATR buffer; TP1/TP2 are the next opposing HTF levels that pay at least 1.5R.\n"
         "5. **Quality gate.** Only auto-send a plan when the rule-based score meets the high-confidence threshold, H4/H1 agree, the entry and TP1 are structural, and volume proxies align across distinct intervals. OHLCV volume is an estimate, not actual aggressor-side flow or proof of resting orders; the score is not a calibrated probability.\n"
-        "6. **Plan lock.** One pending plan per symbol stays fixed until it resolves, expires, is explicitly overridden, or the bias engine confirms a flip — a raw direction change alone does not replace it.\n"
+        "6. **Plan lock.** One pending plan per symbol stays fixed until it resolves, its H1 zone is invalidated, is explicitly overridden, or the bias engine confirms a flip — a raw direction change alone does not replace it.\n"
         "7. **AI is an auditor.** It cannot change direction or levels; it flags risks, reads screenshots and adjusts the score by ±6. Scores are rule-based confluence, not calibrated win probabilities."
     )
     st.markdown(f"- **AI model priority:** {' → '.join(GROQ_MODELS)} (always attempted in this order via Groq, multimodal)")
